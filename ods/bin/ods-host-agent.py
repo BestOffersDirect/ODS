@@ -18920,7 +18920,7 @@ function Get-ODSOpenCodeProcesses {
         $_.ExecutablePath -and
         $_.ExecutablePath.Equals($exe, [StringComparison]::OrdinalIgnoreCase) -and
         $_.CommandLine -match '(?i)\b(web|serve)\b' -and
-        $_.CommandLine -match ('(?i)--port\s+' + [regex]::Escape([string]$port))
+        $_.CommandLine -match ('(?i)--port\s+' + [regex]::Escape([string]$port) + '(?=\s|$)')
     })
 }
 

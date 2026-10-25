@@ -1755,7 +1755,9 @@ function Stop-ODSOpenCodeRuntime {
         if ($exe -and $opencodeExe -and $exe.Equals($opencodeExe, [StringComparison]::OrdinalIgnoreCase)) {
             $isODSOpenCode = (
                 $cmd -match '(?i)\bweb\b' -and
-                $cmd -match ('(?i)--port\s+' + [regex]::Escape($opencodePort))
+                # Match the entire port argument, never another server's 30030
+                # when this installation is configured for 3003.
+                $cmd -match ('(?i)--port\s+' + [regex]::Escape($opencodePort) + '(?=\s|$)')
             )
         }
 
