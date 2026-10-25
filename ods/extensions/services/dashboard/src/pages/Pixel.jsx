@@ -978,6 +978,8 @@ export default function Pixel({ systemStatus = null }) {
           ? 'available'
           : data.state === 'model_switching'
             ? 'switching'
+            : data.state === 'model_unloaded'
+              ? 'unloaded'
             : data.state === 'model_transition_pending'
               ? 'held'
             : data.state === 'chat_recovery_required'
@@ -1769,6 +1771,8 @@ export default function Pixel({ systemStatus = null }) {
       ? (readinessView.attention ? 'Needs attention' : 'Available')
       : status === 'switching'
         ? 'Switching model...'
+      : status === 'unloaded'
+        ? 'Model unloaded'
       : status === 'held'
         ? 'Model transition pending'
       : status === 'recovery'
@@ -1878,6 +1882,7 @@ export default function Pixel({ systemStatus = null }) {
       <ModelActivationNotice value={modelActivation} pending={status === 'switching'} available={status === 'available'} portal onRefresh={()=>setModelStatusRefresh(value=>value+1)}/>
       {status === 'held' && <p role="status" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">{statusDetail}</p>}
       {status === 'recovery' && <p role="alert" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">{statusDetail} <Link to="/settings?section=access" className="underline">Portal permissions</Link></p>}
+      {status === 'unloaded' && <p role="status" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">{statusDetail} <Link to="/models" className="underline">Open Models</Link></p>}
       {status === 'available' && modelSupport && (
         <p role="status" aria-label="Model capability" className="shrink-0 border-b border-theme-border px-4 py-2 text-xs text-theme-text-secondary sm:px-6">
           {modelSupport.detail}
@@ -2049,6 +2054,8 @@ export default function Pixel({ systemStatus = null }) {
               ? `Message ${displayName}...`
               : status === 'switching'
                 ? 'Waiting for model switch...'
+                : status === 'unloaded'
+                  ? 'Messages are held until the model is resumed'
                 : status === 'held'
                   ? 'Messages are held during a model transition'
                 : status === 'recovery'
