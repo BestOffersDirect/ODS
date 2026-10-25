@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -591,6 +592,44 @@ class TestExternalLinks:
         link_ids = [link["id"] for link in data]
         assert "open-webui" in link_ids
         assert "litellm" not in link_ids
+
+    def test_hermes_proxy_link_is_labelled_hermes(self, test_client, monkeypatch):
+        """The proxy's manifest name describes plumbing; the link opens Hermes."""
+        monkeypatch.setattr("main.SERVICES", {
+            "hermes-proxy": {
+                "name": "Hermes Auth Proxy",
+                "port": 9120,
+                "external_port": 9120,
+                "health": "/health",
+                "host": "hermes-proxy",
+                "ui_path": "/auth/ods",
+            },
+        })
+
+        resp = test_client.get("/api/external-links", headers=test_client.auth_headers)
+
+        assert resp.status_code == 200
+        [link] = resp.json()
+        assert link["label"] == "Hermes"
+        assert link["ui_path"] == "/auth/ods"
+        # Health still matches the proxy's own status row, never Hermes Agent's.
+        assert link["healthNeedles"] == ["hermes-proxy", "hermes auth proxy"]
+
+    def test_shipped_token_spy_manifest_has_no_sidebar_link(self, test_client, monkeypatch):
+        """Its page asks for Token Spy's own API key; the Usage page reads it server-side."""
+        import config
+        shipped, _, errors = config.load_extension_manifests(
+            Path(__file__).resolve().parents[2], "nvidia",
+            only_service_ids=frozenset({"token-spy"}),
+        )
+        assert errors == []
+        assert shipped["token-spy"]["external_link"] is False
+        monkeypatch.setattr("main.SERVICES", shipped)
+
+        resp = test_client.get("/api/external-links", headers=test_client.auth_headers)
+
+        assert resp.status_code == 200
+        assert resp.json() == []
 
 
 # --- /api/storage ---
