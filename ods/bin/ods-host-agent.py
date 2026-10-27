@@ -20930,6 +20930,10 @@ def _launch_native_llama_server(env_path: Path, llama_bin: Path, llama_log: Path
     gpu_layers = env.get("N_GPU_LAYERS", "").strip() or "auto"
     model_path = _active_model_directory(env) / gguf_file
     reasoning = env.get("LLAMA_REASONING", "off")
+    # Modes are case-insensitive, as in _pixel_model_reasoning_capable;
+    # llama-server only accepts the lowercase spelling.
+    if reasoning.strip().lower() in {"off", "on", "auto"}:
+        reasoning = reasoning.strip().lower()
     reasoning_fmt = {"off": "none", "on": "deepseek"}.get(reasoning, reasoning)
     # UI LAN access must not publish an unauthenticated inference endpoint.
     bind_addr = "127.0.0.1"

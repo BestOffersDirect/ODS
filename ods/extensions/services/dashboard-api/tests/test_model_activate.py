@@ -2277,6 +2277,31 @@ class TestLaunchNativeLlamaServer:
         assert "deepseek" in cmd
         assert _kwargs["cwd"] == str(tmp_path)
 
+    # llama-server only accepts lowercase; "OFF" used to reach it verbatim
+    # and stop it from starting. A non-mode value still passes through.
+    @pytest.mark.parametrize("value, expected", [
+        ("OFF", "none"), ("Off", "none"), ("ON", "deepseek"), ("AUTO", "auto"), ("deepseek", "deepseek"),
+    ])
+    def test_reasoning_mode_is_case_insensitive(self, monkeypatch, tmp_path, value, expected):
+        env_path = tmp_path / ".env"
+        env_path.write_text(f"GGUF_FILE=test-model.gguf\nLLAMA_REASONING={value}\n", encoding="utf-8")
+        (tmp_path / "data" / "models").mkdir(parents=True)
+        llama_bin = tmp_path / "llama-server"
+        llama_bin.write_text("", encoding="utf-8")
+        calls = []
+
+        class _FakeProc:
+            pid = 4321
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(cmd) or _FakeProc())
+
+        _launch_native_llama_server(env_path, llama_bin, tmp_path / "llama.log", tmp_path / "llama.pid")
+
+        cmd = calls[0]
+        assert cmd[cmd.index("--reasoning-format") + 1] == expected
+
     # Windows launches through ods.ps1 native-llm-restart, which binds loopback.
     @pytest.mark.parametrize('system', ['Darwin', 'Linux'])
     def test_ui_lan_preference_does_not_publish_native_inference(self, monkeypatch, tmp_path, system):
