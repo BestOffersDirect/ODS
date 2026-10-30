@@ -307,7 +307,8 @@ test('visual stops never gain an unverified preview or localhost claim', () => {
   const receipt = recorded.slice(recorded.indexOf('Your preview is ready.'));
   assert.ok(receipt.startsWith(`Your preview is ready.\n\n[Open preview](${details.url})\n\n`), receipt);
   // Failed fetches, not a preview check, stopped it: the page may be unfinished.
-  assert.equal(delivery.text, `${answer}\n\n${PREVIEW_INCOMPLETE_NOTE}\n\n${receipt}`);
+  assert.equal(delivery.text, `${answer}\n\n${PREVIEW_INCOMPLETE_NOTE}\n\n` +
+    `Files changed in this response: \`night-garden/index.html\`.\n\n${receipt}`);
   assert.doesNotMatch(delivery.text, /not proof|not completed|stopped after|tool limit|Open last published preview/);
   assert.equal(delivery.preview.sha256, details.sha256);
 });

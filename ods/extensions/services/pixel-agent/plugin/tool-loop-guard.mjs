@@ -33,7 +33,7 @@ import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
 import { answersClarification, clarificationAnswerContext } from "./pending-clarification.mjs";
 import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON } from "./run-progress-budget.mjs";
-import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
+import { assistantMessageText, changedFilesNote, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION, progressFinalizationHead,
   unverifiedLinksNote } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
@@ -8333,6 +8333,9 @@ export function createToolLoopGuard({
         successfulWritePaths: new Set(),
         boundPreviewWriteDirectories: new Set(),
         successfulEditPaths: new Set(),
+        // Every file a successful write, edit or apply_patch changed in this
+        // response, in order (changedFilesNote); bounded.
+        changedFiles: new Set(),
         successfulWriteContentByPath: new Map(),
         compareSwapRepairCounts: new Map(),
         successfulReadPaths: new Set(),
@@ -11856,7 +11859,9 @@ export function createToolLoopGuard({
       : undefined;
     if (successfulMutation) {
       for (const file of workspaceMutationFiles(successfulMutation.name,successfulMutation.event?.params)) {
-        if (state.latestStandaloneUnittest?.relativePath === normalizeWorkspaceFilePath(file)) {
+        const changedPath = normalizeWorkspaceFilePath(file);
+        if (changedPath && state.changedFiles.size < 64) state.changedFiles.add(changedPath);
+        if (state.latestStandaloneUnittest?.relativePath === changedPath) {
           state.latestVerificationStatus = undefined;
           state.latestStandaloneUnittest = undefined;
         }
@@ -14530,6 +14535,7 @@ export function createToolLoopGuard({
       // published, already links that preview and says what it does not prove.
       const preview = failure?.preview ? undefined : progressStopPreview(state);
       return {status: 'failed', text: [runDeadlineStopText(state.runDeadline, state.workspaceMutationObserved),
+        changedFilesNote([...state.changedFiles]),
         preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
         failure && ownerOutcomeText(failure)].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
       ...(failure?.preview ? {preview: failure.preview}
@@ -14561,6 +14567,7 @@ export function createToolLoopGuard({
     if (state?.progressBudget.exhausted) {
       const preview = progressStopPreview(state);
       const receipt = preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {};
+      const changed = changedFilesNote([...state.changedFiles]);
       // The request is still incomplete ('failed'); only the finalization
       // turn's validated answer replaces the canned stop text, followed by
       // host facts that the model cannot alter.
@@ -14576,13 +14583,14 @@ export function createToolLoopGuard({
           refusedToolCalls: state.progressFinalization.partial,
           requestedTextMissing: requestedTextDeliveryNote(preview, state.workspaceRequestedTextCheck,
             state.workspaceControlNameCheck),
+          changedFiles: [...state.changedFiles],
           ...(modelAnswer ? {} : {synthesis: {note: STOP_SYNTHESIS_NOTE, pages: synthesized.pages}})});
         // A website build's owner reads the answer, then Portal's line in
-        // place of the stop facts after it; links the answer cites without a
-        // read receipt, and a host synthesis's source, stay said. A partial
-        // answer (its calls were refused) or one that announces more work
-        // ends unfinished.
-        const stop = progressStopPresentation(state, verification, [unverifiedLinksNote(unverified),
+        // place of the stop facts after it; the files it changed, links the
+        // answer cites without a read receipt, and a host synthesis's source,
+        // stay said. A partial answer (its calls were refused) or one that
+        // announces more work ends unfinished.
+        const stop = progressStopPresentation(state, verification, [changed, unverifiedLinksNote(unverified),
           ...(modelAnswer ? [] : [STOP_SYNTHESIS_NOTE, composeReadPages(synthesized.pages)])],
         {continues: state.progressFinalization.partial || announcesMoreWork(answer)});
         const result = {status: 'failed', text, ...receipt};
@@ -14597,12 +14605,12 @@ export function createToolLoopGuard({
       const pages = readPages ? `\n\n${readPages}` : '';
       // Without an answer, a research-loop stop keeps its specific text.
       if (state.researchStopped) return {status: 'failed', text: WEB_LOOP_DELIVERY_REASON + pages, ...receipt};
-      const text = RUN_PROGRESS_STOP_REASON + (preview
+      const text = RUN_PROGRESS_STOP_REASON + (changed ? `\n\n${changed}` : '') + (preview
         ? `\n\n[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.` : '') +
         pages;
       // A website build's owner reads Portal's line and the preview card, or
       // what there is and what to do next, in place of this stop text.
-      const stop = progressStopPresentation(state, verification, [readPages]);
+      const stop = progressStopPresentation(state, verification, [changed, readPages]);
       return stop ? previewOutcome({status: 'failed', text, ...receipt}, {...stop, text})
         : {status: 'failed', text, ...receipt};
     }
