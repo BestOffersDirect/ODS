@@ -244,8 +244,9 @@ export const FREE_EMPTY_LOOKUPS_PER_RUN = 12;
 // times without an edit is still refused (failedExecRetries).
 export const FREE_NODE_RESULTS_PER_RUN = 12;
 
-// After every this many reads (read calls, and exec commands that only search
-// or print line ranges) in a response that has not changed a file yet, one
+// After every this many reads (read calls, and exec commands that only read
+// files: run-progress-budget.mjs readOnlyLookup) in a response that has not
+// changed a file with write, edit or apply_patch yet, one
 // fixed notice asks the model to record what it needs and start changing files;
 // at most EDIT_EARLY_NOTICES per response. On the laptop (2026-10-30) a
 // 227-call elf-of-doom run never edited: by the time it reached the end of
@@ -11565,10 +11566,9 @@ export function createToolLoopGuard({
     const refusedCall = state.previewRevalidationRefusedCalls?.delete(toolCallId) === true && failedToolOutcome(event);
     const noWorkspaceEffect = refusedCall || workspaceReadOnlyCall(toolName, event?.params);
     if (!noWorkspaceEffect) state.previewVerificationGeneration = (state.previewVerificationGeneration ?? 0) + 1;
-    // Counted for EDIT_EARLY_NOTICE: reads, and commands made only of searches
-    // and line-range prints (the model's own command, from the pending record),
-    // on the outer call only, because a nested Tool Search execution reports
-    // the same action again.
+    // Counted for EDIT_EARLY_NOTICE: reads, and commands that only read files
+    // (the model's own command, from the pending record), on the outer call
+    // only, because a nested Tool Search execution reports the same action again.
     const readingTool = toolName === 'tool_call' ? String(event?.params?.id ?? '').split(':').at(-1) : toolName;
     if (!String(toolCallId).startsWith('tool_search_code:') && (readingTool === 'read' ||
         (readingTool === 'exec' && readOnlyLookup(pendingToolRun?.selectedParams?.command)))) state.readsSinceChange += 1;
