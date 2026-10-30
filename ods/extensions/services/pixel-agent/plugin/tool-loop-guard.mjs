@@ -244,6 +244,10 @@ export const FREE_EMPTY_LOOKUPS_PER_RUN = 12;
 // times without an edit is still refused (failedExecRetries).
 export const FREE_NODE_RESULTS_PER_RUN = 12;
 
+// Per response: files kept for the stop's list of changed files
+// (changedFilesNote). Past this the list undercounts what it does not name.
+export const MAX_CHANGED_FILES_RECORDED = 256;
+
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
 export const DERIVED_COPY_WRITE_REASON =
@@ -771,6 +775,16 @@ function normalizeWorkspaceFilePath(value) {
     value = value.slice("workspace/".length);
   }
   return value.replace(/^(?:\.\/)+/, "");
+}
+
+// A path under the configured workspace root (a native run's absolute path)
+// spelled relative to it, with inner "./" segments dropped; any other value
+// unchanged. For listing only, never for scope checks.
+function workspaceRelativeSpelling(file, root) {
+  if (typeof file !== "string") return file;
+  const base = typeof root === "string" ? root.replace(/\/+$/, "") : "";
+  const relative = base && file.startsWith(`${base}/`) ? file.slice(base.length + 1) : file;
+  return relative.replace(/\/(?:\.\/)+/g, "/");
 }
 
 // A normalized workspace-relative file path, or undefined for absolute,
@@ -8334,7 +8348,7 @@ export function createToolLoopGuard({
         boundPreviewWriteDirectories: new Set(),
         successfulEditPaths: new Set(),
         // Every file a successful write, edit or apply_patch changed in this
-        // response, in order (changedFilesNote); bounded.
+        // response, in order (changedFilesNote); bounded by MAX_CHANGED_FILES_RECORDED.
         changedFiles: new Set(),
         successfulWriteContentByPath: new Map(),
         compareSwapRepairCounts: new Map(),
@@ -11859,9 +11873,12 @@ export function createToolLoopGuard({
       : undefined;
     if (successfulMutation) {
       for (const file of workspaceMutationFiles(successfulMutation.name,successfulMutation.event?.params)) {
-        const changedPath = normalizeWorkspaceFilePath(file);
-        if (changedPath && state.changedFiles.size < 64) state.changedFiles.add(changedPath);
-        if (state.latestStandaloneUnittest?.relativePath === changedPath) {
+        // Listed by its workspace-relative path only; other absolute or
+        // traversing spellings are left out.
+        const changedPath = derivedWorkspacePath(normalizeWorkspaceFilePath(
+          workspaceRelativeSpelling(file, state.configuredWorkspaceRoot)));
+        if (changedPath && state.changedFiles.size < MAX_CHANGED_FILES_RECORDED) state.changedFiles.add(changedPath);
+        if (state.latestStandaloneUnittest?.relativePath === normalizeWorkspaceFilePath(file)) {
           state.latestVerificationStatus = undefined;
           state.latestStandaloneUnittest = undefined;
         }
@@ -14179,7 +14196,9 @@ export function createToolLoopGuard({
             },
           }, {text, rest: link, note: state.codingExhausted ? PREVIEW_STOPPED_NOTE : PREVIEW_EARLIER_NOTE});
         }
-        const hasIndexEvidence = [
+        // Files this response changed by any file tool also count: the stop's
+        // list of changed files must not sit beside "didn't create the files".
+        const hasIndexEvidence = state.changedFiles.size > 0 || [
           ...state.successfulWritePaths,
           ...state.successfulReadPaths,
         ].some(
@@ -14503,6 +14522,11 @@ export function createToolLoopGuard({
       delete result.deliveryMode;
     }
     if (owner) result=explainedPreviewDelivery(result, owner);
+    // A stop's text, in the owner's wording, stays within what the ingress
+    // accepts (parseVerificationResponse); past it the owner got no reply. A
+    // long tool-limit answer with unread links and changed files could reach it.
+    if (result.status === 'failed' && result.text?.length > MAX_INGRESS_VERIFICATION_TEXT)
+      result = {...result, text: result.text.slice(0, MAX_INGRESS_VERIFICATION_TEXT)};
     // The shipped example's one owner line, which Portal's ingress adds after
     // the reply it delivers (host/pixel_ingress.mjs). A pending question card
     // carries none.
