@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {CODING_REPEAT_NO_PROGRESS_REASON, CODING_RETRY_EXHAUSTED_REASON, createToolLoopGuard,
+import {CODING_REPEAT_NO_PROGRESS_REASON, createToolLoopGuard,
   FREE_REPEAT_COMMANDS_PER_RUN} from '../plugin/tool-loop-guard.mjs';
 import {RUN_PROGRESS_LIMITS, RUN_PROGRESS_STOP_REASON} from '../plugin/run-progress-budget.mjs';
 import {PROGRESS_FINALIZATION_INSTRUCTION} from '../plugin/progress-finalization.mjs';
@@ -23,7 +23,7 @@ const PRINTED = completed(0, '1:// Elf of Doom — AI, updates, rendering, UI wi
 const MISSING = completed(2, "sed: can't read game.js: No such file or directory");
 
 function harness({wrapped = false} = {}) {
-  const guard = createToolLoopGuard();
+  const guard = createToolLoopGuard({execControl:{prepare:(_run, command) => command, signal:() => true}});
   const context = {agentId:'pixel', runId:'run', sessionId:'owner-session', sessionKey:'owner-key'};
   guard.observeRun(context, 'pixel', {prompt});
   let sequence = 0;
@@ -41,6 +41,13 @@ function harness({wrapped = false} = {}) {
         details:{status:'blocked', deniedReason:'plugin-before-tool-call', reason:decision.blockReason}};
     } else {
       executed = wrapped ? decision?.params ?? params : {...params, ...decision?.params};
+      if (wrapped) {
+        // Tool Search runs the core exec as a nested child with its own hooks.
+        const childId = `tool_search_code:${id}:exec:1`, childCtx = {...context, toolName:'exec', toolCallId:childId};
+        const child = guard.beforeToolCall({toolName:'exec', params:executed.args, toolCallId:childId}, childCtx);
+        assert.notEqual(child?.block, true, child?.blockReason);
+        guard.afterToolCall({toolName:'exec', params:child?.params ?? executed.args, toolCallId:childId, result:inner}, childCtx);
+      }
       const envelope = {tool:{id:'openclaw:core:exec', name:'exec', source:'openclaw', sourceName:'core'}, result:inner};
       result = wrapped ? {content:[{type:'text', text:JSON.stringify(envelope)}], details:envelope} : inner;
     }
@@ -53,18 +60,23 @@ function harness({wrapped = false} = {}) {
   }
   const exhausted = () => STOPPED.includes(guard.beforeToolCall({toolName:'read', params:{path:'README.md'}, toolCallId:'probe'},
     {...context, toolName:'read', toolCallId:'probe'})?.blockReason);
-  // Reads `sed -n 'a,bp' ui.js` twice, then asks a third time.
+  // Asks for the same `sed -n 'a,bp' ui.js` until it is refused: the third ask
+  // in the direct transport, the second in Tool Search, which also counts the
+  // nested child's receipt as a run (as on main).
   const repeat = n => {
     const command = `sed -n '${n * 100 + 1},${n * 100 + 100}p' ui.js`;
-    for (let i = 0; i < 2; i++) assert.equal(exec(command, PRINTED)?.block, undefined);
-    return exec(command, PRINTED);
+    for (let i = 0; i < 3; i++) {
+      const decision = exec(command, PRINTED);
+      if (decision?.block) return decision;
+    }
+    assert.fail(`never refused: ${command}`);
   };
   return {exec, exhausted, repeat};
 }
 
 test('the refusal explains why the output may be gone and how to go on', () => {
-  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /so Portal did not run it again/);
-  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /Portal keeps only your most recent tool output/);
+  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /without a write, edit, or apply_patch since, so Portal did not run it again/);
+  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /in a long response Portal replaces older tool output with a short notice/);
   assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /keep the facts you still need .* in the explanation of update_plan/);
   assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /write, edit, or apply_patch, or give the owner a visible blocker/);
 });
@@ -92,11 +104,5 @@ for (const wrapped of [false, true]) {
     assert.equal(run.repeat(FREE_REPEAT_COMMANDS_PER_RUN).blockReason, CODING_REPEAT_NO_PROGRESS_REASON);
     for (let i = 0; i < RUN_PROGRESS_LIMITS.consecutiveFailures - 1; i++) run.exec(`sed -n 1,20p game-${i}.js`, MISSING);
     assert.equal(run.exhausted(), true);
-  });
-
-  test(`${transport}: asking for the same refused command again still ends coding tools`, () => {
-    const run = harness({wrapped});
-    run.repeat(0);
-    assert.equal(run.exec("sed -n '1,100p' ui.js", PRINTED).blockReason, CODING_RETRY_EXHAUSTED_REASON);
   });
 }

@@ -166,7 +166,7 @@ export const CODING_RETRY_EXHAUSTED_REASON =
   "Pixel stopped a no-progress coding repair loop after its bounded failed-verification limit. Do not call another tool in this turn. Give the user a visible summary of the verified failure, the changes attempted, and the most useful next step.";
 
 export const CODING_REPEAT_NO_PROGRESS_REASON =
-  "That exact command already succeeded twice in this response without a workspace change, so Portal did not run it again. Its earlier output may have left your view: Portal keeps only your most recent tool output. Read only the lines you need (search for a name, then print a short range), keep the facts you still need (file, line numbers, names) in the explanation of update_plan, and perform the requested change with write, edit, or apply_patch, or give the owner a visible blocker.";
+  "That exact command already succeeded twice in this response without a write, edit, or apply_patch since, so Portal did not run it again. Its earlier output may have left your view: in a long response Portal replaces older tool output with a short notice. Read only the lines you need (search for a name, then print a short range), keep the facts you still need (file, line numbers, names) in the explanation of update_plan, and perform the requested change with write, edit, or apply_patch, or give the owner a visible blocker.";
 
 export const CODING_LOOP_ABORT_REASON =
   "Pixel stopped this response because it requested another coding tool after the repeated-command limit was reached. Start a fresh message to continue from the preserved workspace with a different approach.";
@@ -247,11 +247,13 @@ export const FREE_NODE_RESULTS_PER_RUN = 12;
 // Per run: how many refusals of an identical read-only command that already
 // succeeded twice (CODING_REPEAT_NO_PROGRESS_REASON) are recorded as advice
 // instead of failures. Nothing ran, and the model mostly asks again because the
-// earlier output left its view: the tool-result projection keeps only the most
-// recent output (laptop, 2026-10-30: four of the thirteen failures charged in a
-// 227-call elf-of-doom run were these refusals, after its reads of ui.js had
-// been dropped from the prompt). A second refusal of the same command still
-// ends coding tools for the response.
+// earlier output left its view: past its budget the tool-result projection
+// replaces older output with a notice (laptop, 2026-10-30: four of the thirteen
+// failures charged in a 227-call elf-of-doom run were these refusals, after its
+// reads of ui.js had been dropped from the prompt). The refusal's receipt keeps
+// its existing bookkeeping (a refused test run still counts as a failed
+// verification), so in the direct transport the same command may run again
+// after it, as before; the Tool Search transport ends coding tools instead.
 export const FREE_REPEAT_COMMANDS_PER_RUN = 12;
 
 // Refusals for a write that re-types existing workspace files (see
@@ -8460,9 +8462,6 @@ export function createToolLoopGuard({
         invalidExecArgumentAttempts: 0,
         successfulExec: new Map(),
         successfulExecBlocks: new Map(),
-        // Calls refused with CODING_REPEAT_NO_PROGRESS_REASON. Their command never
-        // ran, so their failed receipt must not count as a run of it.
-        repeatRefusedCalls: new Set(),
         failedVerificationAttempts: 0,
         latestVerificationStatus: undefined,
         latestVerificationFingerprint: undefined,
@@ -10607,10 +10606,9 @@ export function createToolLoopGuard({
       if (fingerprint && (state.successfulExec.get(fingerprint) ?? 0) >= 2) {
         const blocks = state.successfulExecBlocks.get(fingerprint) ?? 0;
         if (blocks === 0) {
-          const refusedCallId = context?.toolCallId ?? event?.toolCallId;
           state.successfulExecBlocks.set(fingerprint, 1);
-          if (typeof refusedCallId === "string" && refusedCallId) state.repeatRefusedCalls.add(refusedCallId);
-          recordFreeCorrection(state, "repeat-command", refusedCallId, toolName, FREE_REPEAT_COMMANDS_PER_RUN);
+          recordFreeCorrection(state, "repeat-command", context?.toolCallId ?? event?.toolCallId, toolName,
+            FREE_REPEAT_COMMANDS_PER_RUN);
           return { block: true, blockReason: CODING_REPEAT_NO_PROGRESS_REASON };
         }
         state.codingExhausted = true;
@@ -12427,10 +12425,6 @@ export function createToolLoopGuard({
       : undefined;
     const execEvent = toolName === "exec" ? event : wrappedExecEvent;
     if (!execEvent) return;
-    // Counted as a failed run of the command, the refusal reset its repeat
-    // count, so in the direct transport the same command ran again where the
-    // Tool Search transport ended coding tools.
-    if (state.repeatRefusedCalls.delete(toolCallId)) return;
     const observedFingerprint = execFingerprint(execEvent?.params);
     const fingerprint = state.execOriginalByWrapped.get(observedFingerprint) ?? observedFingerprint;
     const boundExecution = boundExecReceipt(
