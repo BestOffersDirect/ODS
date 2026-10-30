@@ -6,11 +6,22 @@ import re
 # The Portal limits that stop a round without ending its goal (pixel_outcome
 # `stop`, set by the Pixel plugin's tool-loop-guard). The next round continues
 # from the saved work, within the same round and stall limits as any other.
+# Not covered: a round whose attempt was retried (after compaction) can reach
+# the ingress's whole-response limit first; it delivers no outcome, and the
+# goal ends as before.
 GOAL_CONTINUE_STOPS = frozenset({'tool-limit', 'run-deadline'})
+# Plain words without defect vocabulary: Pixel picks its defect-report guide
+# from this prompt (tool-loop-guard.mjs userMessageReportsDefect).
 _STOP_NOTES = {
-    'tool-limit': "The last round was stopped by Portal's tool limit before it finished. ",
-    'run-deadline': 'The last round was stopped by the 30-minute limit before it finished. ',
+    'tool-limit': "The last round reached Portal's tool limit before it finished. ",
+    'run-deadline': "The last round reached Portal's time limit for one response before it finished. ",
 }
+# Pixel marks a stopped round's plan blocked with its own stop summary. The
+# goal card shows the saved plan until the next round publishes its own, so
+# that plan is saved as still active, with this summary.
+_STOPPED_SUMMARY = 'Continuing from the saved work'
+# Stopped rounds in a row that may continue without a newly completed step.
+GOAL_STOPPED_ROUNDS = 3
 
 
 def public_plan(value):
@@ -75,12 +86,16 @@ def goal_prompt(row, agent, answer=''):
 
 
 def round_file_edits(activity):
-    """Successful file-changing calls of one round, from its public activity."""
-    for item in (activity or {}).get('activities') or []:
+    """Completed file-changing calls of one round, from its public activity.
+    An edit a stop cut off is still running, not completed."""
+    activity = activity or {}
+    for item in activity.get('activities') or []:
         if isinstance(item, dict) and item.get('kind') == 'edit':
             calls, failures = item.get('calls'), item.get('failures')
             if type(calls) is int and type(failures) is int and calls >= failures >= 0:
-                return calls - failures
+                running = sum(1 for event in activity.get('events') or [] if isinstance(event, dict)
+                              and event.get('kind') == 'edit' and event.get('state') == 'running')
+                return max(calls - failures - running, 0)
     return 0
 
 
@@ -91,21 +106,26 @@ def goal_decision(agent, stopped=None):
     old = agent.get('goal_plan')
     if old and old['steps'] and plan and plan['steps'] and [(s['id'], s['title']) for s in old['steps']] != [(s['id'], s['title']) for s in plan['steps']]:
         return 'The model replaced its unfinished plan. Saved work was preserved; review it before continuing.'
+    if plan and stopped and plan['status'] == 'blocked':
+        plan = {**plan, 'status': 'active', 'summary': _STOPPED_SUMMARY}
     if plan and plan['steps']:
         agent['goal_plan'] = plan
-    if plan and plan['status'] == 'completed':
+    # A stopped round's completion report is checked by the next round.
+    if plan and plan['status'] == 'completed' and not stopped:
         return None
-    # A stopped round's plan is marked blocked by Pixel itself, not by the
-    # model, so only a model's own blocked report ends the goal.
-    if plan and (plan['status'] == 'waiting' or (plan['status'] == 'blocked' and not stopped)):
+    if plan and plan['status'] in {'blocked', 'waiting'}:
         return plan['summary']
     completed = sorted(s['id'] for s in (plan or {}).get('steps', []) if s['status'] == 'completed')
-    # Progress is a newly completed step or a changed file: a long build keeps
-    # its "work" step running for many rounds while files change.
-    progressed = completed != agent.get('goal_progress', []) or round_file_edits(agent.get('activity')) > 0
+    stepped = completed != agent.get('goal_progress', [])
+    # A round a Portal limit stopped can be in the middle of a long step, so
+    # its saved file changes count as progress too, for at most
+    # GOAL_STOPPED_ROUNDS such rounds in a row. Other rounds need a newly
+    # completed step.
+    agent['goal_stopped_rounds'] = agent.get('goal_stopped_rounds', 0) + 1 if stopped and not stepped else 0
+    progressed = stepped or (bool(stopped) and round_file_edits(agent.get('activity')) > 0)
     agent['goal_stalls'] = 0 if progressed else agent.get('goal_stalls', 0) + 1
     agent['goal_progress'] = completed
     agent['goal_stopped'] = stopped
-    if agent['goal_stalls'] >= 4 or agent.get('goal_round', 0) >= 11:
+    if agent['goal_stalls'] >= 4 or agent['goal_stopped_rounds'] > GOAL_STOPPED_ROUNDS or agent.get('goal_round', 0) >= 11:
         return 'The goal is incomplete. Automatic continuation paused because progress could not be confirmed or the turn limit was reached.'
     return 'continue'

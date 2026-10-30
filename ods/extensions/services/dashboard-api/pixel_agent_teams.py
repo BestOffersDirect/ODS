@@ -477,7 +477,12 @@ class TeamManager:
                             self._save(owner, row)
                             last_save = time.monotonic()
                     stopped = self.store.get(owner, row["id"])["stop_requested"]
-                    if done and not error and outcome in {'none', 'passed'} and publication:
+                    # A goal round that a Portal limit stopped, with its reply
+                    # received, continues from the saved work like any other
+                    # unfinished round, and keeps its publication; every other
+                    # failed round ends the goal.
+                    goal_stop = limit_stop if row.get('mode') == 'goal' and done and not error and content.strip() else None
+                    if done and not error and (outcome in {'none', 'passed'} or goal_stop) and publication:
                         agent['publication'] = publication
                     row["stop_requested"] = stopped
                     if content:
@@ -490,6 +495,8 @@ class TeamManager:
                             plan = public_plan((agent.get('activity') or {}).get('goal'))
                             if plan and plan['steps']:
                                 agent['goal_plan'] = plan
+                            # The answer continues this round, which was not stopped.
+                            agent['goal_stopped'] = None
                         agent["questions"] = questions
                         agent["status"], row["status"] = "waiting", "waiting"
                         self._save(owner, row)
@@ -501,10 +508,6 @@ class TeamManager:
                         agent["finished"] = time.time()
                         self._stop_remaining(owner, row)
                         return
-                    # A goal round that a Portal limit stopped, with its reply
-                    # received, continues from the saved work like any other
-                    # unfinished round; every other failed round ends the goal.
-                    goal_stop = limit_stop if row.get('mode') == 'goal' and done and not error and content.strip() else None
                     if (not done or error or not content.strip() or outcome not in {"none", "passed"}) and not goal_stop:
                         if (not done or error or not content.strip()) and agent['role']!='builder' and agent.get('recoveries',0)<1:
                             agent['recoveries']=1

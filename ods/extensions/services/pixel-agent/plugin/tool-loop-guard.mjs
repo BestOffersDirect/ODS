@@ -7841,6 +7841,9 @@ export function createToolLoopGuard({
   // (subagent-delivery.mjs ownerRunOf), for the shipped example's guard.
   exampleOwnerRun = () => undefined,
   exampleGuard,
+  // Whether a run is a /goal round (goal-progress.mjs), whose verification
+  // says which limit stopped it.
+  goalRun = () => false,
   // Whether Pixel's model is the owner's remote API route, whose output limit
   // the owner sets (Settings → Remote model), for output-limit stop text.
   remoteModelRoute = () => false,
@@ -14508,12 +14511,16 @@ export function createToolLoopGuard({
     const notice = result.status === 'pending' ? undefined
       : [cut, exampleNoticeForRun(runId)].filter(Boolean).join(' ').slice(0, 1024);
     if (notice) result = {...result, notice};
-    // Which limit stopped this response, for goal mode's controller
-    // (dashboard-api portal_goal.py): it continues a goal after these stops.
-    // A repeated web-research loop is not one of them: resumed, it loops again.
-    const stop = result.status !== 'failed' || state?.clientCancelled ? undefined
-      : state?.runDeadlineReached ? 'run-deadline'
-      : state?.progressBudget.exhausted && !state.researchStopped && !state.webLoopAborted ? 'tool-limit' : undefined;
+    // Which limit stopped this goal round, for goal mode's controller
+    // (dashboard-api portal_goal.py): it continues the goal after these stops.
+    // Goal rounds only, since an ingress older than this field refuses it. Not
+    // for receipt-based work (Operations, exact downloads, managed extension
+    // requests, a refused delete) or a repeated web-research loop: resumed,
+    // they would repeat a download, an approval card or the loop.
+    const stop = result.status !== 'failed' || !state || !goalRun(runId) ||
+        !progressFinalizationEligible(state) || state.operationsLoopAborted ? undefined
+      : state.runDeadlineReached ? 'run-deadline'
+      : state.progressBudget.exhausted && !state.researchStopped ? 'tool-limit' : undefined;
     if (stop) result = {...result, stop};
     return artifacts?.length && !state.clientCancelled && ['none','passed','failed'].includes(result.status)
       ? {...result,artifacts:structuredClone(artifacts)} : result;
