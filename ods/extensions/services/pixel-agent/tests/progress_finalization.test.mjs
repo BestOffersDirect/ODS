@@ -367,7 +367,7 @@ test('no change when the budget is not hit', () => {
   for (let i = 0; i < RUN_PROGRESS_LIMITS.consecutiveFailures - 1; i++) {
     const persisted = JSON.stringify(persistFailure(guard, `failed-${i}`) ?? {});
     // Never the stop; only the one warning that comes before it, on the third failure in a row.
-    assert.doesNotMatch(persisted, /Tools are now disabled|stopped after repeated/);
+    assert.doesNotMatch(persisted, /tool limit|stopped after repeated/);
     assert.equal(persisted.includes(RUN_PROGRESS_WARNING_TEXT), i === RUN_PROGRESS_WARNING.consecutiveFailures - 1);
   }
   guard.observeModelCall({}, context);

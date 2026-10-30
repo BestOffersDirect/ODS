@@ -105,9 +105,15 @@ test('the search shapes Portal charged on the laptop on 2026-10-30 are empty ans
     ["cd /workspace/Playground/elf-of-doom && grep -n \"\" ui.js | sed -n '560,600p'; echo ====; grep -n \"\" ui.js | sed -n '1762,1830p'; echo ====; grep -n \"function updateCamera\" -A 18 engine.js",
       '560:  if (G.freezeT > 0) { G.freezeT -= dt; return; }\n===='],
   ]) assert.equal(lookupFoundNothing(command, receipt(output)), true, command);
-  // A cd that failed printed the shell's error: not an answer, whichever separator follows it.
-  for (const command of ['cd /workspace/missing; grep -n x ui.js', 'cd /workspace/missing && grep -n x ui.js'])
-    assert.equal(lookupFoundNothing(command, receipt("sh: 1: cd: can't cd to /workspace/missing")), false, command);
+  // A cd that failed printed the shell's error: not an answer, whichever separator
+  // follows it and whatever path the shell names itself by.
+  for (const command of ['cd /workspace/missing; grep -n x ui.js', 'cd /workspace/missing && grep -n x ui.js']) {
+    for (const error of ["sh: 1: cd: can't cd to /workspace/missing", "/bin/sh: 1: cd: can't cd to /workspace/missing",
+      'bash: line 1: cd: /workspace/missing: No such file or directory'])
+      assert.equal(lookupFoundNothing(command, receipt(error)), false, `${command} / ${error}`);
+  }
+  assert.equal(nodeReportedFailure('cd /workspace/missing; node --check chars.js',
+    receipt("/bin/sh: 1: cd: can't cd to /workspace/missing\nchars.js:3\nSyntaxError: Unexpected token")), false);
   // In a pipe, sed may only print a line range of what it is piped.
   for (const command of [
     "grep -n x f | sed -n '1,5p' f; grep -n y f", "grep -n x f | sed '1,5p'; grep -n y f", "grep -n x f | sed -n '1,5w out'; grep -n y f",
@@ -214,6 +220,35 @@ test('one warning comes before a failure limit, again only after a full window, 
   const near = createRunProgressBudget();
   for (let n = 0; n < 8; n++) near.observeResult({callId:`s-${n}`, failed:true, lane:'extension'});
   assert.equal(near.takeWarning(), true);
+});
+
+test('a new streak, a lane streak and a compacted warning are warned again; polls do not dilute', () => {
+  const again = createRunProgressBudget();
+  for (let n = 0; n < 3; n++) again.observeResult({callId:`a-${n}`, failed:true});
+  assert.equal(again.takeWarning(), true);
+  again.observeResult({callId:'ok', tool:'read', params:{path:'x'}, failed:false});
+  for (let n = 3; n < 6; n++) again.observeResult({callId:`a-${n}`, failed:true});
+  assert.equal(again.takeWarning(), true, 'a new streak after a success');
+  // A lane streak that has not yet stopped its lane is warned, then the lane stops.
+  const lane = createRunProgressBudget();
+  for (let n = 0; n < 3; n++) lane.observeResult({callId:`w-${n}`, failed:true, lane:'workspace'});
+  assert.equal(lane.takeWarning(), true);
+  assert.equal(lane.takeWarning(), false);
+  // Compaction may summarize a delivered warning away: the one due comes again.
+  lane.rearmWarning();
+  assert.equal(lane.takeWarning(), true);
+  lane.observeResult({callId:'w-3', failed:true, lane:'workspace'});
+  assert.equal(lane.laneExhausted('workspace'), true);
+  // A running process's polls are verified waits, not results: three polls
+  // between failing calls cannot keep a failing loop going.
+  const polls = createRunProgressBudget();
+  let stoppedAt;
+  for (let n = 0; n < 200 && stoppedAt === undefined; n++) {
+    for (let k = 0; k < 3; k++) polls.observeResult({callId:`p-${n}-${k}`, tool:'process', pending:true, failed:false});
+    polls.observeResult({callId:`c-${n}`, tool:'exec', params:{command:`curl -s localhost:${3000 + n}`}, failed:true});
+    if (polls.exhausted) stoppedAt = n;
+  }
+  assert.equal(stoppedAt, RUN_PROGRESS_LIMITS.recentFailures - 1);
 });
 
 test('a node check, test or harness reported a failure only when it completed with exit 1 and printed it', () => {

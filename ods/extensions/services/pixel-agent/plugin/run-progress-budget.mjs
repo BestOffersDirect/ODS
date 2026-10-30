@@ -61,10 +61,14 @@ export function createRunProgressBudget() {
   let rounds = 0;
   let consecutiveFailures = 0;
   let terminal = false;
-  // Charged results, oldest first: true for a failure. Discovery never enters.
+  // Charged results, oldest first: true for a failure. Discovery and process
+  // polls never enter.
   const recent = [];
   let charged = 0;
-  let warnedAt;
+  // takeWarning: whether the current streak was warned, and when the last
+  // warning about the recent failures came.
+  let streakWarned = false;
+  let windowWarnedAt;
   const seenCalls = new Set();
   const successes = new Map();
   const laneFailures = new Map();
@@ -82,17 +86,31 @@ export function createRunProgressBudget() {
     stop() { terminal = true; },
     get exhaustedLanes() { return [...exhaustedLanes]; },
     laneExhausted(lane) { return exhaustedLanes.has(lane); },
-    // True when the run has come within reach of a failure limit and has not
-    // been warned in the last recentResults charged results. The caller
-    // delivers RUN_PROGRESS_WARNING_TEXT, so a change spread over several
-    // files can be finished or undone before tools are switched off.
+    // True when the run has come within reach of a failure limit: once per
+    // failure streak (the global one, or a lane's that has not stopped that
+    // lane), and for the recent failures at most once per recentResults
+    // charged results. The caller delivers RUN_PROGRESS_WARNING_TEXT, so a
+    // change spread over several files can be finished or undone before tools
+    // are switched off.
     takeWarning() {
       if (terminal) return false;
-      const near = consecutiveFailures >= RUN_PROGRESS_WARNING.consecutiveFailures ||
-        recentFailures() >= RUN_PROGRESS_WARNING.recentFailures;
-      if (!near || (warnedAt !== undefined && charged - warnedAt < RUN_PROGRESS_LIMITS.recentResults)) return false;
-      warnedAt = charged;
+      const streak = consecutiveFailures >= RUN_PROGRESS_WARNING.consecutiveFailures ||
+        [...laneFailures].some(([lane, count]) => count >= RUN_PROGRESS_WARNING.consecutiveFailures && !exhaustedLanes.has(lane));
+      if (streak && !streakWarned) {
+        streakWarned = true;
+        windowWarnedAt = charged;
+        return true;
+      }
+      if (recentFailures() < RUN_PROGRESS_WARNING.recentFailures ||
+          (windowWarnedAt !== undefined && charged - windowWarnedAt < RUN_PROGRESS_LIMITS.recentResults)) return false;
+      windowWarnedAt = charged;
       return true;
+    },
+    // Compaction may have summarized a delivered warning away: the next one
+    // that is due is delivered again.
+    rearmWarning() {
+      streakWarned = false;
+      windowWarnedAt = undefined;
     },
     beginModelRound() {
       if (++rounds > RUN_PROGRESS_LIMITS.roundsWithoutProgress) terminal = true;
@@ -122,12 +140,15 @@ export function createRunProgressBudget() {
       // successful search between failed actions must not erase their history
       // or let differently worded searches keep a run alive indefinitely.
       if (discovery || tool === 'tool_search' || tool === 'tool_describe' || tool === 'pixel_ods_skill') return;
-      charge(false);
       consecutiveFailures = 0;
       if (classifiedLane) laneFailures.set(classifiedLane, 0);
+      if (!classifiedLane || [...laneFailures.values()].every(count => count === 0)) streakWarned = false;
       // An actual running-process receipt is a verified wait, not a failure.
-      // Plain text saying "running" must never be supplied as this signal.
+      // Plain text saying "running" must never be supplied as this signal. Nor
+      // does it dilute the recent failures: a loop that polls a server that
+      // never answers between failing calls still stops.
       if (pending) { rounds = 0; return; }
+      charge(false);
       const fingerprint = createHash('sha256').update(JSON.stringify([tool, params], (_key, value) =>
         value && typeof value === 'object' && !Array.isArray(value)
           ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]]))
@@ -163,6 +184,8 @@ const LOOKUP_CD = /^cd[ \t]+(?:'[^'\r\n]*'|"[^"$`\\\r\n]*"|[A-Za-z0-9._/-]+)[ \t
 const LOOKUP_NOTICE = /^[ef]?grep: (?:warning: .*|.*: binary file matches)$/gm;
 const LOOKUP_ERROR = new RegExp([
   '^(?:sh|bash|dash|[ef]?grep|rg|sed|git|which|head|tail|cat|wc|sort|uniq|fatal)(?:: \\d+)?: ',
+  // A cd that failed, whatever path the shell names itself by.
+  "\\bcd: can't cd to ",
   // rg 13 prints regex, argument and file errors without its name.
   '^(?:regex parse error|error|usage|Usage|Illegal option)\\b',
   ': (?:No such file or directory|Permission denied|Is a directory)$',
@@ -278,7 +301,7 @@ export function lookupFoundNothing(command, result) {
 // node run: `node` with long options (--name or --name=value) and either
 // --check (or -c) and one script, --test and its files, or a script file and
 // its arguments, optionally behind `timeout DURATION` and followed by 2>&1,
-// joined by `;` or `&&`, after one optional literal `cd DIR &&`. Inline code
+// joined by `;` or `&&`, after one optional literal `cd DIR &&` or `cd DIR;`. Inline code
 // (-e, -p, --eval, --print), stdin, the REPL, --run (a package.json shell
 // script), other short options, pipes, `||`, redirections, substitutions and
 // environment assignments disqualify it. Only exit 1 with output qualifies.
@@ -291,6 +314,7 @@ const NODE_REFUSED_OPTION = /^--(?:eval|print|interactive|run)(?:=|$)/;
 const NODE_SETUP_ERROR = new RegExp([
   // The shell, timeout or env could not start node, or a step failed to start.
   '^(?:sh|bash|dash|timeout|env)(?:: \\d+)?: ',
+  "\\bcd: can't cd to ",
   // A wrong path: the script, an imported module or a file it opened is missing.
   '\\b(?:MODULE_NOT_FOUND|ERR_MODULE_NOT_FOUND|ENOENT)\\b',
   // node --test names a test file that does not exist.
