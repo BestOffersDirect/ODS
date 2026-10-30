@@ -14508,6 +14508,13 @@ export function createToolLoopGuard({
     const notice = result.status === 'pending' ? undefined
       : [cut, exampleNoticeForRun(runId)].filter(Boolean).join(' ').slice(0, 1024);
     if (notice) result = {...result, notice};
+    // Which limit stopped this response, for goal mode's controller
+    // (dashboard-api portal_goal.py): it continues a goal after these stops.
+    // A repeated web-research loop is not one of them: resumed, it loops again.
+    const stop = result.status !== 'failed' || state?.clientCancelled ? undefined
+      : state?.runDeadlineReached ? 'run-deadline'
+      : state?.progressBudget.exhausted && !state.researchStopped && !state.webLoopAborted ? 'tool-limit' : undefined;
+    if (stop) result = {...result, stop};
     return artifacts?.length && !state.clientCancelled && ['none','passed','failed'].includes(result.status)
       ? {...result,artifacts:structuredClone(artifacts)} : result;
   }

@@ -238,7 +238,7 @@ test('Spark replay: the deadline stop replaces the runtime advice in every deliv
   f.at(30);
   f.guard.observeAgentEnd(CUT_OFF, OWNER);
   const verification = f.guard.deliveryVerificationForRun(RUN_ID);
-  assert.deepEqual(verification, {status: 'failed', text: STOP_COPY});
+  assert.deepEqual(verification, {status: 'failed', text: STOP_COPY, stop: 'run-deadline'});
   const reply = f.guard.replyPayloadSending({runId: RUN_ID, kind: 'final', payload: {text: OPENCLAW_TIMEOUT_TEXT, isError: true}});
   assert.equal(reply.payload.text, STOP_COPY);
 });
@@ -249,7 +249,7 @@ test('a response that changed no files is not told its project may be broken', (
   f.at(30);
   f.guard.observeAgentEnd({...CUT_OFF, messages: [CUT_OFF.messages[0],
     {role: 'assistant', stopReason: 'aborted', content: []}]}, OWNER);
-  assert.deepEqual(f.guard.deliveryVerificationForRun(RUN_ID), {status: 'failed', text: UNCHANGED_STOP_COPY});
+  assert.deepEqual(f.guard.deliveryVerificationForRun(RUN_ID), {status: 'failed', text: UNCHANGED_STOP_COPY, stop: 'run-deadline'});
 });
 
 for (const [name, end] of [
@@ -383,5 +383,6 @@ test(`Portal receives the ODS stop over the real ingress, stream=${stream}, publ
     : JSON.parse(body).choices[0].message.content;
   assert.equal(text, expected);
   assert.doesNotMatch(body, /timeoutSeconds|LLM request failed/);
-  if (stream) assert.equal(frames.at(-1).pixel_outcome.status, 'failed');
+  // Goal mode's controller continues a goal after this stop (dashboard-api portal_goal.py).
+  if (stream) assert.deepEqual(frames.at(-1).pixel_outcome, {schemaVersion: 1, status: 'failed', stop: 'run-deadline'});
 });

@@ -68,6 +68,91 @@ async def test_goal_never_replays_ambiguous_effects_or_reports_false_completion(
     assert len(calls)==len(set(calls)) and not row['agents'][0]['retryable']
 
 
+def stopped_round(content, stop='tool-limit', status='failed'):
+    # A round a Portal limit stopped: its reply arrived, its outcome is failed.
+    yield {'choices': [{'delta': {'content': content}}]}
+    yield {'choices': [{'delta': {}, 'finish_reason': 'stop'}],
+           'pixel_outcome': {'schemaVersion': 1, 'status': status, **({'stop': stop} if stop else {})}}
+    yield {'_done': True, '_state': 'complete'}
+
+
+def edits_frame(status='active', edits=0):
+    frame=goal_frame(status)
+    if edits:frame['pixel_task']['activities']=[{'kind':'edit','calls':edits+1,'failures':1,'blocked':0}]
+    return frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop', ['tool-limit', 'run-deadline'])
+async def test_a_round_a_portal_limit_stopped_continues_the_goal(tmp_path, stop):
+    # Laptop, 2026-10-30: long changes stop at the tool limit; a goal used to end there.
+    calls=[]
+    async def run(owner,agent):
+        calls.append(copy.deepcopy(agent))
+        if len(calls)==1:
+            # Pixel itself marks the plan of a stopped run blocked.
+            yield edits_frame('blocked',edits=3)
+            for frame in stopped_round('Cache written; the blit in ui.js is left.',stop):yield frame
+        else:
+            yield goal_frame('completed')
+            for frame in finish('Actual final result'):yield frame
+    manager=TeamManager(TeamStore(tmp_path/'teams'),run,yes)
+    manager.start(OWNER,'chat','goal','Make enemies draw from a sprite cache',None,'','goal')
+    await settle(manager)
+    row=manager.list(OWNER,'chat')[0]
+    assert row['status']=='completed' and len(calls)==2
+    prompt=calls[1]['messages'][-1]['content']
+    note={'tool-limit':"stopped by Portal's tool limit",'run-deadline':'stopped by the 30-minute limit'}[stop]
+    # The note follows the sentence Pixel reads the owner's words up to.
+    assert prompt.index('Continue this goal from the saved work.')<prompt.index(note)
+    assert any(m['content']=='Cache written; the blit in ui.js is left.' for m in calls[1]['messages'])
+
+
+@pytest.mark.asyncio
+async def test_changed_files_count_as_goal_progress_and_stops_without_progress_still_pause(tmp_path):
+    calls=[]
+    async def run(owner,agent):
+        calls.append(agent['request_id'])
+        if len(calls)<6:
+            yield edits_frame(edits=2)
+            for frame in stopped_round('More files changed; still working.'):yield frame
+        else:
+            yield goal_frame('completed')
+            for frame in finish('Actual final result'):yield frame
+    manager=TeamManager(TeamStore(tmp_path/'teams'),run,yes)
+    manager.start(OWNER,'chat','goal','Build the long feature',None,'','goal')
+    await settle(manager)
+    assert manager.list(OWNER,'chat')[0]['status']=='completed' and len(calls)==6
+    # The same stops with no changed file and no finished step pause after four rounds.
+    idle=[]
+    async def stuck(owner,agent):
+        idle.append(agent['request_id'])
+        yield edits_frame()
+        for frame in stopped_round('Still reading.'):yield frame
+    manager=TeamManager(TeamStore(tmp_path/'idle'),stuck,yes)
+    manager.start(OWNER,'chat','goal','Build the long feature',None,'','goal')
+    await settle(manager)
+    row=manager.list(OWNER,'chat')[0]
+    assert row['status']=='failed' and len(idle)==4
+    assert row['agents'][0]['error'].startswith('The goal is incomplete.')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stop', [None, 'output-limit', ['tool-limit']])
+async def test_other_failed_rounds_still_end_the_goal(tmp_path, stop):
+    calls=[]
+    async def run(owner,agent):
+        calls.append(agent['request_id'])
+        yield edits_frame(edits=2)
+        for frame in stopped_round('Tests failed.',stop):yield frame
+    manager=TeamManager(TeamStore(tmp_path/'teams'),run,yes)
+    manager.start(OWNER,'chat','goal','Fix the parser',None,'','goal')
+    await settle(manager)
+    row=manager.list(OWNER,'chat')[0]
+    assert row['status']=='failed' and len(calls)==1
+    assert row['agents'][0]['error']=='The agent could not verify completion. Its response is not a verified result.'
+
+
 @pytest.mark.asyncio
 async def test_stop_partial_goal_never_starts_a_continuation_or_claims_completed(tmp_path):
     started,release=asyncio.Event(),asyncio.Event()
