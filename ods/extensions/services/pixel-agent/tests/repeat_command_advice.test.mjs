@@ -65,7 +65,7 @@ function harness({wrapped = false} = {}) {
 test('the refusal explains why the output may be gone and how to go on', () => {
   assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /so Portal did not run it again/);
   assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /Portal keeps only your most recent tool output/);
-  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /as plain text in your message before the next tool call/);
+  assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /keep the facts you still need .* in the explanation of update_plan/);
   assert.match(CODING_REPEAT_NO_PROGRESS_REASON, /write, edit, or apply_patch, or give the owner a visible blocker/);
 });
 

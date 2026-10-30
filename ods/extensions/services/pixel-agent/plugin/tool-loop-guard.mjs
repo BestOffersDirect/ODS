@@ -166,7 +166,7 @@ export const CODING_RETRY_EXHAUSTED_REASON =
   "Pixel stopped a no-progress coding repair loop after its bounded failed-verification limit. Do not call another tool in this turn. Give the user a visible summary of the verified failure, the changes attempted, and the most useful next step.";
 
 export const CODING_REPEAT_NO_PROGRESS_REASON =
-  "That exact command already succeeded twice in this response without a workspace change, so Portal did not run it again. Its earlier output may have left your view: Portal keeps only your most recent tool output. Read only the lines you need (search for a name, then print a short range), write the facts you still need (file, line numbers, names) as plain text in your message before the next tool call, and perform the requested change with write, edit, or apply_patch, or give the owner a visible blocker.";
+  "That exact command already succeeded twice in this response without a workspace change, so Portal did not run it again. Its earlier output may have left your view: Portal keeps only your most recent tool output. Read only the lines you need (search for a name, then print a short range), keep the facts you still need (file, line numbers, names) in the explanation of update_plan, and perform the requested change with write, edit, or apply_patch, or give the owner a visible blocker.";
 
 export const CODING_LOOP_ABORT_REASON =
   "Pixel stopped this response because it requested another coding tool after the repeated-command limit was reached. Start a fresh message to continue from the preserved workspace with a different approach.";
