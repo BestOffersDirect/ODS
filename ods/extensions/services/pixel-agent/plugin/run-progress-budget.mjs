@@ -196,11 +196,23 @@ function isLookupSink([program, ...args]) {
   return program === 'cat' && args.length === 0;
 }
 
-export function lookupFoundNothing(command, result) {
-  if (typeof command !== 'string' || command.length > 4096) return false;
+function lookupShape(command) {
+  if (typeof command !== 'string' || command.length > 4096) return null;
   const steps = lookupSteps(command.trim().replace(LOOKUP_CD, ''));
-  if (!steps || !steps.every(([first, ...sinks]) =>
-    (isLookup(first) || isLookupCompanion(first)) && sinks.every(isLookupSink))) return false;
+  return steps && steps.every(([first, ...sinks]) =>
+    (isLookup(first) || isLookupCompanion(first)) && sinks.every(isLookupSink)) ? steps : null;
+}
+
+// A command of that shape with at least one search or line-range print, whatever
+// it returned, only reads files: the edit-early notice in tool-loop-guard.mjs
+// counts it as a read.
+export function readOnlyLookup(command) {
+  return Boolean(lookupShape(command)?.some(([[program]]) => program !== 'echo'));
+}
+
+export function lookupFoundNothing(command, result) {
+  const steps = lookupShape(command);
+  if (!steps) return false;
   const last = steps.at(-1);
   if (last.length !== 1 || !isLookup(last[0]) || steps.slice(0, -1).some(([[program]]) => program === 'rg')) return false;
   const details = result?.details;

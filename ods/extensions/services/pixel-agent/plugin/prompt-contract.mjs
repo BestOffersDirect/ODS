@@ -387,7 +387,7 @@ export function contractSize(context, { configuredContextWindow, configuredLeanP
 // beside the conversation contract rather than in it: the compact and tiny
 // contracts repeat the full contract's supplement under fixed size caps.
 export const ODS_LONG_TASK_CONTRACT =
-  "Long tasks: Portal keeps only your most recent tool output in view, and older results are replaced by a short notice, so a file you read early may be gone later. Read narrowly (search for the names you need, then read short ranges, not whole large files), keep the facts you will need later (file, line numbers, names) in the explanation of update_plan, and make the first change as soon as you know enough for it.";
+  "Long tasks: in a long response Portal replaces older tool output with a short notice, so a file you read early may be gone later. Read narrowly (search for the names you need, then read short ranges, not whole large files), keep the facts you will need later (file, line numbers, names) in the explanation of update_plan, and make the first change as soon as you know enough for it.";
 
 // The long-task line for this run, or '' for small contracts and for team
 // roles that plan or review instead of changing files.

@@ -471,7 +471,10 @@ export default definePluginEntry({
       const appendContext = [goalProgress.active(context?.runId ?? event?.runId) ? goalContract : '', languageNote,
         toolLoopGuard.clarificationContextForRun(context?.runId ?? event?.runId) ??
           toolLoopGuard.clarificationContextForRun(delegationDelivery.ownerRunFor(context))].filter(Boolean).join('\n\n');
-      const longTask = longTaskContract(context, ownerEvent, {configuredContextWindow, configuredLeanPrompt});
+      // Ordinary workspace work only: Operations, exact downloads and managed
+      // extension requests refuse update_plan, and read-only roles cannot edit.
+      const longTask = toolLoopGuard.longTaskEligible(context?.runId ?? event?.runId)
+        ? longTaskContract(context, ownerEvent, {configuredContextWindow, configuredLeanPrompt}) : '';
       return contract ? { ...contract, ...(prependContext ? {prependContext} : {}), ...(appendContext ? {appendContext} : {}), appendSystemContext: `${inResponseLanguage(ACTIVITY_CONTRACT, configuredResponseLanguage)} ${executionLocationContext(context, AGENT_ID)} ${goalProgress.active(context?.runId ?? event?.runId) ? goalContract : ""} ${contract.appendSystemContext}${longTask ? ` ${longTask}` : ''} ${inResponseLanguage(executionContext(), configuredResponseLanguage)} ${repositoryEvidence}` } : prependContext ? {prependContext} : undefined;
     });
     api.on("model_call_started", (event, context) =>
