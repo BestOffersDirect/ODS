@@ -5,7 +5,7 @@ const COMPLETION_NOTE = /^\[ODS Pixel execution\] Exec returned completed with e
 // Fixed notices the guard may append after a result's own blocks (the run
 // deadline, the failure warning, the edit-early notice): the completion note
 // is the last block before them.
-const TRAILING_NOTICE = /^\[ODS Pixel (?:time limit|failure warning)\] |^\[ODS Pixel next step\] Many tool calls in this response have read files without changing any\./;
+const TRAILING_NOTICE = /^\[ODS Pixel (?:time limit|failure warning)\] |^\[ODS Pixel next step\] Many tool calls in this response have read files, and none has changed one with write, edit or apply_patch\./;
 
 export function leakedExecGuidance(reply, messages, ownerText = '', currentReceipts = []) {
   if (typeof reply !== 'string' || !Array.isArray(messages)) return undefined;

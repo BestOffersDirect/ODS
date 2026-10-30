@@ -254,7 +254,7 @@ export const FREE_NODE_RESULTS_PER_RUN = 12;
 export const EDIT_EARLY_READS = 30;
 export const EDIT_EARLY_NOTICES = 2;
 export const EDIT_EARLY_NOTICE =
-  "[ODS Pixel next step] Many tool calls in this response have read files without changing any. In a long response Portal replaces older tool output with a short notice, so more reading can push out what you read first. If the owner asked for a change, keep the facts you need in the explanation of update_plan and make the first change now, reading further only for the exact lines you are about to change. If the owner asked only for an explanation or a review, answer from what you have read.";
+  "[ODS Pixel next step] Many tool calls in this response have read files, and none has changed one with write, edit or apply_patch. In a long response Portal replaces older tool output with a short notice, so more reading can push out what you read first. If the owner asked for a change, keep the facts you need in the explanation of update_plan and make the first change now, reading further only for the exact lines you are about to change. If the owner asked only for an explanation or a review, answer from what you have read.";
 
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
@@ -9480,8 +9480,10 @@ export function createToolLoopGuard({
           .slice(continuationDirectory.length + 1)
           .split("/")
           .every((part) => WORKSPACE_PATH_COMPONENT.test(part));
+      // update_plan has no workspace effect; long fixes keep their notes in it
+      // (ODS_LONG_TASK_CONTRACT, EDIT_EARLY_NOTICE).
       if (
-        (!["read", "write", "edit", "exec", "process", "tool_search", "tool_describe", WORKSPACE_PREVIEW_TOOL, PREVIEW_INSPECTION_TOOL, WORKSPACE_BUNDLE_TOOL].includes(selectedToolName) &&
+        (!["read", "write", "edit", "exec", "process", "tool_search", "tool_describe", "update_plan", WORKSPACE_PREVIEW_TOOL, PREVIEW_INSPECTION_TOOL, WORKSPACE_BUNDLE_TOOL].includes(selectedToolName) &&
           !(state.workspaceExtensionIsolated && EXTENSION_METADATA_TOOLS.has(selectedToolName))) ||
         (FILE_PATH_TOOLS.has(selectedToolName) && !insideContinuationDirectory)
       ) {

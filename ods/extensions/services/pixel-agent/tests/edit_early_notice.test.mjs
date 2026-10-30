@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {createToolLoopGuard, EDIT_EARLY_NOTICE, EDIT_EARLY_NOTICES, EDIT_EARLY_READS} from '../plugin/tool-loop-guard.mjs';
 import {contractSize, longTaskContract, ODS_LONG_TASK_CONTRACT, ODS_CONVERSATION_CONTRACT,
   promptContractForAgent} from '../plugin/prompt-contract.mjs';
@@ -87,17 +88,55 @@ test('the entry adds the long-task line to ordinary turns only', async t => {
   }
 });
 
-test('only searches and line-range prints count as reads among commands', () => {
+test('only commands that read files count as reads', () => {
   for (const command of [
     'cd /workspace/Playground/elf-of-doom && sed -n 200,420p engine.js',
     'grep -n "draw\\|blit\\|cache" engine.js | head -80',
     'grep -n "^function " chars.js | head -60 && echo ---- && sed -n 360,420p chars.js',
     'rg -n drawEnemyEnt',
+    // The second review's probes, and the 2026-10-30 run's own shapes.
+    'cat ui.js', 'cat -n ui.js | sed -n 100,200p', 'head -n 200 ui.js', 'tail -n +100 ui.js', 'head -60 README.md',
+    'nl -ba ui.js | sed -n 1,80p', "sed -n '/function draw/,/^}/p' ui.js", 'grep -n draw ui.js 2>&1',
+    `grep -n "" ui.js | sed -n '1597,1712p'`, 'wc -l *.js',
   ]) assert.equal(readOnlyLookup(command), true, command);
   for (const command of [
-    "sed -i 's/a/b/' ui.js", 'node --check ui.js', 'node bench.mjs', 'echo ===', 'ls -la',
-    'grep -n x ui.js > found.txt', 'cp ui.js ui.bak', 'python3 tools/bake.py', undefined,
+    "sed -i 's/a/b/' ui.js", "sed -n '/x/w out.txt' ui.js", "sed -n '1,5p;w out.txt' ui.js", 'node --check ui.js',
+    'node bench.mjs', 'echo ===', 'ls -la', 'grep -n x ui.js > found.txt', 'cat ui.js > copy.js', 'head -n 5 ui.js | tee x',
+    'tail -f server.log', 'sort -o out.txt ui.js', 'cat ui.js | sort -o out.txt', 'cp ui.js ui.bak', 'python3 tools/bake.py',
+    'cat', undefined,
   ]) assert.equal(readOnlyLookup(command), false, String(command));
+});
+
+// A visual follow-up (a change to an app published earlier in the session)
+// gets the long-task line, so its own tool boundary allows update_plan too.
+test('a visual follow-up keeps update_plan for its notes', () => {
+  const guard = createToolLoopGuard();
+  const at = (runId, toolName, toolCallId) => ({agentId:'pixel', runId, sessionId:'session-1', toolName, toolCallId});
+  guard.observeRun({agentId:'pixel', runId:'run-1', sessionId:'session-1'}, 'pixel', {prompt:'Build and show me an interactive website demo.'});
+  const write = {path:'signal-garden/index.html', content:'<!doctype html><title>Signal Garden</title><p>slow</p>'};
+  guard.beforeToolCall({toolName:'write', runId:'run-1', params:write}, at('run-1', 'write', 'w1'), 'pixel');
+  guard.afterToolCall({toolName:'write', runId:'run-1', params:write, result:{details:{status:'completed'}}}, at('run-1', 'write', 'w1'), 'pixel');
+  // The host's snapshot digest of signal-garden/ (one file), as the preview tool reports it.
+  const length = (bytes, value) => { const buffer = Buffer.alloc(bytes); bytes === 4 ? buffer.writeUInt32BE(value) : buffer.writeBigUInt64BE(BigInt(value)); return buffer; };
+  const sha256 = createHash('sha256').update(length(4, 10)).update('index.html').update(length(8, write.content.length)).update(write.content).digest('hex');
+  const siteId = `site-${sha256.slice(0, 24)}`;
+  const preview = {relativeDirectory:'signal-garden'};
+  guard.beforeToolCall({toolName:'pixel_ods_workspace_preview', runId:'run-1', params:preview}, at('run-1', 'pixel_ods_workspace_preview', 'p1'), 'pixel');
+  guard.afterToolCall({toolName:'pixel_ods_workspace_preview', runId:'run-1', params:preview, result:{details:{
+    schemaVersion:1, kind:'ods-pixel-workspace-preview', status:'succeeded', relativeDirectory:'signal-garden', siteId, port:9437,
+    url:`http://${siteId}.localhost:9437/${siteId}/`, files:1, bytes:write.content.length, sha256, entryFile:'index.html',
+    entrySha256:createHash('sha256').update(write.content).digest('hex'), httpStatus:200, readbackVerified:true, executable:false, overwritten:false}}},
+  at('run-1', 'pixel_ods_workspace_preview', 'p1'), 'pixel');
+  guard.observeRun({agentId:'pixel', runId:'run-2', sessionId:'session-1'}, 'pixel', {prompt:'The button does not work. ' +
+    'Investigate your existing artifact, fix that defect without starting over or using a template, republish the same artifact, ' +
+    'and report only what the tools verify.'});
+  assert.equal(guard.longTaskEligible('run-2'), true);
+  const plan = {explanation:'ui.js:120 draws enemies', plan:[{step:'Edit draw', status:'in_progress'}]};
+  assert.equal(guard.beforeToolCall({toolName:'update_plan', runId:'run-2', params:plan}, at('run-2', 'update_plan', 'plan-1'), 'pixel')?.block, undefined);
+  assert.equal(guard.beforeToolCall({toolName:'tool_call', runId:'run-2', params:{id:'openclaw:core:update_plan', args:plan}},
+    at('run-2', 'tool_call', 'plan-2'), 'pixel')?.block, undefined);
+  // The lane still keeps other tools out.
+  assert.equal(guard.beforeToolCall({toolName:'web_search', runId:'run-2', params:{query:'x'}}, at('run-2', 'web_search', 's-1'), 'pixel')?.block, true);
 });
 
 for (const wrapped of [false, true]) {
@@ -120,9 +159,9 @@ for (const wrapped of [false, true]) {
     for (; n < 3 * EDIT_EARLY_READS; n++) assert.equal(noticed(run.read(n)), false, `read ${n}`);
   });
 
-  test(`${transport}: checks, scripts and listings are not counted as reads`, () => {
+  test(`${transport}: checks, scripts, listings and in-place edits are not counted as reads`, () => {
     const run = harness({wrapped});
-    const others = [n => `node --check part${n}.js`, n => `node bench${n}.mjs`, n => `ls -la dir${n}`, n => `wc -l f${n}.js`];
+    const others = [n => `node --check part${n}.js`, n => `node bench${n}.mjs`, n => `ls -la dir${n}`, n => `sed -i 's/a${n}/b/' ui.js`];
     for (let n = 0; n < 2 * EDIT_EARLY_READS; n++) assert.equal(noticed(run.command(n, others[n % others.length](n))), false, `command ${n}`);
     const noticedAt = [];
     for (let n = 1; n <= EDIT_EARLY_READS; n++) if (noticed(run.command(n, `sed -n '${n},${n + 40}p' ui.js`))) noticedAt.push(n);
