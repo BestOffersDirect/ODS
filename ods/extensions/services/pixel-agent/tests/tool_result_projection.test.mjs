@@ -18,12 +18,14 @@ function calculateMaxToolResultChars() { return 16000; }
 function calculateRecoveryAggregateToolResultChars(ctx, max, aggregate) { return Math.max(1, aggregate ?? max ?? calculateMaxToolResultChars(ctx)); }
 function truncateToolResultMessage(msg, maxChars) { let left = maxChars; return {...msg, content: msg.content.map(b => { if (!isToolResultTextBlock(b)) return b; const text = b.text.slice(0, Math.max(0, left)); left -= text.length; return {...b, text}; })}; }
 `;
-const project = vm.runInNewContext(`${helpers}\n${definition[1]}\ntruncateOversizedToolResultsInMessages`, {Math, Map, Set, Array, Object, Number});
+const project = vm.runInNewContext(`${helpers}\n${definition[1]}\ntruncateOversizedToolResultsInMessages`, {Math, Map, Set, Array, Object, Number, JSON, Boolean});
 const MAX = 16000, BUDGET = 4 * MAX;
 // Return main-realm values so structural assertions compare plain data.
 const realm = (projection, input) => ({messages: projection.messages === input ? input : structuredClone(projection.messages),
   truncatedCount: projection.truncatedCount});
-const run = (messages, max = MAX) => realm(project(messages, 131072, max, 4 * max, {}), messages);
+// Below 128K tokens the base aggregate applies throughout; `wide` runs a 131K model.
+const run = (messages, max = MAX) => realm(project(messages, 65536, max, 4 * max, {}), messages);
+const wide = (messages, max = MAX) => realm(project(messages, 131072, max, 4 * max, {}), messages);
 const textOf = (message) => message.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n');
 let nextId = 0;
 const call = () => ({role: 'assistant', content: [{type: 'toolCall', id: `call-${nextId}`, name: 'exec', arguments: {}}]});
@@ -132,6 +134,94 @@ test('within budget nothing changes; an oversized result is still capped per res
   const capped = run(history);
   assert.equal(textOf(capped.messages.at(-1)).length, MAX);
   assert.equal(capped.truncatedCount, 1);
+});
+
+const inView = messages => messages.filter((m) => m.role === 'toolResult' && !/truncated; rerun/.test(textOf(m)))
+  .reduce((sum, m) => sum + textOf(m).length, 0);
+
+test('during a response a 131K model keeps twice the aggregate in view', () => {
+  // Laptop, 2026-10-30: one response re-read all of ui.js about nine times once
+  // its earlier reads were reduced, with the prompt never above 55K of 131K tokens.
+  const history = [{role: 'user', content: 'owner'}];
+  let previous = null, rewrites = 0;
+  const steady = [];
+  for (let i = 0; i < 60; i++) {
+    turn(history, 6000);
+    const {messages} = wide(history);
+    assert.equal(textOf(messages.at(-1)).length, 6000, `result ${i} delivered whole`);
+    const kept = inView(messages);
+    assert.ok(kept <= 2 * BUDGET, `in view ${kept}`);
+    if (i >= 25) steady.push(kept);
+    const sent = messages.map((m) => (m.role === 'toolResult' ? textOf(m) : null));
+    if (previous && previous.some((text, index) => text !== sent[index])) rewrites++;
+    previous = sent;
+  }
+  // Between trims to the low watermark (half the doubled aggregate) the view
+  // grows back to 128k: 60-128k in view instead of 32-64k.
+  assert.ok(Math.min(...steady) >= BUDGET - 6000, `at least the base aggregate less one result (${Math.min(...steady)})`);
+  const mean = steady.reduce((sum, kept) => sum + kept, 0) / steady.length;
+  assert.ok(mean >= 1.4 * BUDGET, `on average ${Math.round(mean)} in view`);
+  // Reductions stay rare: about one per 64k of new output.
+  assert.ok(rewrites >= 3 && rewrites <= 5, `rewrites ${rewrites}`);
+  // Below 128K tokens nothing changes.
+  assert.ok(inView(run(history).messages) <= BUDGET);
+});
+
+// The tool loop's overflow guard (tool-result-context-guard) measures this
+// projection: tool output counts twice against window x 4 x 0.9 characters,
+// tool-call arguments and other text once.
+const GUARD_LIMIT = Math.floor(131072 * 4 * 0.9);
+const guardEstimate = messages => messages.reduce((sum, m) => sum + (m.role === 'toolResult' ? 2 * textOf(m).length
+  : m.role === 'assistant' ? m.content.reduce((chars, b) => chars + (b.type === 'toolCall' ? JSON.stringify(b.arguments ?? {}).length : b.text.length), 0)
+  : m.content.length), 0);
+
+test('the wider view never trips the overflow guard where the base view would fit', () => {
+  // A long editing response: every round writes 5k of code and reads 6k.
+  const history = [{role: 'user', content: 'owner'}];
+  let other = 'owner'.length, widened = 0, narrowedAt = -1;
+  for (let i = 0; i < 90; i++) {
+    const args = {path: 'Playground/game/ui.js', content: 'x'.repeat(5000)};
+    history.push({role: 'assistant', content: [{type: 'toolCall', id: `call-${nextId}`, name: 'write', arguments: args}]}, result(6000));
+    other += JSON.stringify(args).length;
+    const sent = wide(history).messages;
+    const kept = inView(sent);
+    assert.equal(textOf(sent.at(-1)).length, 6000, `result ${i} delivered whole`);
+    if (kept > BUDGET) widened++;
+    // The wider view trims to half the doubled aggregate (64k); the base view
+    // to half the base (32k). A drop below 40k is the switch to the base view.
+    if (narrowedAt < 0 && widened && kept < BUDGET / 2 + 8000) narrowedAt = i;
+    if (narrowedAt >= 0) assert.ok(kept <= BUDGET, `round ${i}: ${kept} in view after narrowing at round ${narrowedAt}`);
+    // While the base aggregate fits under the guard, so does what is sent;
+    // where even the smallest wider view would not fit, the base view is sent.
+    if (other + 2 * BUDGET <= GUARD_LIMIT) assert.ok(guardEstimate(sent) <= GUARD_LIMIT, `round ${i}: ${guardEstimate(sent)}`);
+    if (other + 2 * (BUDGET - 8000) > GUARD_LIMIT) assert.ok(kept <= BUDGET, `round ${i}: ${kept} in view`);
+  }
+  assert.ok(widened >= 30, `the wider view was used (${widened} rounds)`);
+  assert.ok(narrowedAt > 0, 'and given up before the guard limit');
+  // A reading response with little else keeps the wider view throughout.
+  const reading = [{role: 'user', content: 'owner'}];
+  for (let i = 0; i < 90; i++) turn(reading, 6000);
+  assert.ok(inView(wide(reading).messages) > BUDGET);
+});
+
+test('a transcript that ends with a final reply keeps the base aggregate the compaction check measures', () => {
+  const history = [{role: 'user', content: 'owner'}];
+  for (let i = 0; i < 30; i++) turn(history, 6000);
+  assert.ok(inView(wide(history).messages) > BUDGET);
+  history.push({role: 'assistant', content: [{type: 'text', text: 'Done: the cache is in place.'}]});
+  assert.ok(inView(wide(history).messages) <= BUDGET, 'the pre-prompt check sees what it saw before');
+  // A reply that still calls tools is not final.
+  history.push({role: 'assistant', content: [{type: 'text', text: 'Checking once more.'}, {type: 'toolCall', id: 'x', name: 'exec', arguments: {}}]});
+  assert.ok(inView(wide(history).messages) > BUDGET);
+});
+
+test('the next owner message keeps what the response sent, so its prefix stays byte-stable', () => {
+  const history = [{role: 'user', content: 'owner'}];
+  for (let i = 0; i < 30; i++) turn(history, 6000);
+  const during = wide(history).messages;
+  history.push({role: 'assistant', content: [{type: 'text', text: 'Done.'}]}, {role: 'user', content: 'continue'});
+  const next = wide(history).messages;
+  assert.deepEqual(next.slice(0, during.length), during);
 });
 
 test('repair is selected by Linux/WSL installation, foreign restore and native macOS composition', () => {

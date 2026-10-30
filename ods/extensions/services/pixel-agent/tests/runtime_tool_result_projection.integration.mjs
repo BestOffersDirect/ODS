@@ -52,6 +52,8 @@ const candidate = load(candidateSource);
 
 // ODS sets toolResultMaxChars 16000; the attempt passes 4x as the aggregate.
 const MAX = 16000, CONTEXT = 131072;
+// Below 131k tokens a response keeps the base aggregate (4 x 16k) in view.
+const BASE_CONTEXT = 65536;
 const model = {id: 'ods/current', provider: 'ods-gateway', api: 'openai-completions', input: ['text'], reasoning: false};
 let id = 0;
 const block = (chars, fill) => ({type: 'text', text: fill.repeat(Math.ceil(chars / fill.length)).slice(0, chars)});
@@ -70,16 +72,17 @@ const RECORDED_HISTORY = [444, 77, 75, 3645, 5622, 5826, 1195, 776, 1147, 192, 4
   5822, 91, 607, 91, 4304, 596, 3653, 995, 8462, 472, 96, 184, 184, 90, 88, 775, 3095, 14030, 3936];
 const FOLLOW_UP = [[3653, 411], [3643, 181], [408, 181], [408, 181], [9502, 181], 9672, 9672];
 
-function attempt(runtime, history, sizes) {
+function attempt(runtime, history, sizes, context = CONTEXT) {
   // One embedded attempt: projection at attempt start, then one provider
   // request per tool turn with the attempt's projection state.
   const state = runtime.createToolResultPromptProjectionState();
   const messages = [...history, {role: 'user', content: 'FOLLOWUP CODE TASK', timestamp: 1}];
-  runtime.truncateOversizedToolResultsInMessages(history, CONTEXT, MAX, 4 * MAX, state);
-  const requests = [runtime.truncateOversizedToolResultsInMessages(messages, CONTEXT, MAX, 4 * MAX, state).messages];
+  runtime.truncateOversizedToolResultsInMessages(history, context, MAX, 4 * MAX, state);
+  // Each request as sent: an unchanged projection is the growing array itself.
+  const requests = [[...runtime.truncateOversizedToolResultsInMessages(messages, context, MAX, 4 * MAX, state).messages]];
   for (const size of sizes) {
     messages.push(...toolTurn([size]));
-    requests.push(runtime.truncateOversizedToolResultsInMessages(messages, CONTEXT, MAX, 4 * MAX, state).messages);
+    requests.push([...runtime.truncateOversizedToolResultsInMessages(messages, context, MAX, 4 * MAX, state).messages]);
   }
   return {messages, requests};
 }
@@ -97,7 +100,7 @@ test('pinned projection sends new results empty once the context holds 64k chars
 });
 
 test('repaired projection delivers every new result whole through the same transport', () => {
-  const {messages, requests} = attempt(candidate, history(), FOLLOW_UP);
+  const {messages, requests} = attempt(candidate, history(), FOLLOW_UP, BASE_CONTEXT);
   const results = messages.filter(message => message.role === 'toolResult').slice(-FOLLOW_UP.length);
   requests.slice(1).forEach((request, index) => {
     assert.equal(toolMessages(request).at(-1).content, expectedText(results[index]), `result ${index} reaches the provider whole`);
@@ -108,9 +111,24 @@ test('repaired projection delivers every new result whole through the same trans
     'older results carry the runtime truncation notice instead');
 });
 
-test('repaired projection keeps the sent prefix stable across calls and across the next attempt', () => {
+// 2026-10-30: in a large-context response the same history and follow-up
+// (114k characters of tool output) stay whole, so nothing is read again.
+test('a large-context response keeps the recorded history whole while it fits twice the base aggregate', () => {
+  const {messages, requests} = attempt(candidate, history(), FOLLOW_UP);
+  const results = messages.filter(message => message.role === 'toolResult');
+  assert.deepEqual(toolMessages(requests.at(-1)).map(message => message.content), results.map(expectedText));
+  // A turn that ends with the final reply, as the pre-prompt compaction check
+  // sees it, is measured at the base aggregate.
+  const ended = [...messages, {role: 'assistant', content: [{type: 'text', text: 'Done.'}], api: model.api, provider: model.provider,
+    model: model.id, stopReason: 'stop', timestamp: 1_790_000_100_000}];
+  const measured = candidate.truncateOversizedToolResultsInMessages(ended, CONTEXT, MAX, 4 * MAX).messages;
+  assert.ok(toolMessages(measured).some(message => /more characters truncated; rerun with narrower args if needed\]$/.test(message.content)));
+});
+
+for (const context of [BASE_CONTEXT, CONTEXT])
+test(`repaired projection keeps the sent prefix stable across calls and across the next attempt (${context / 1024}k)`, () => {
   const base = history();
-  const first = attempt(candidate, base, FOLLOW_UP.slice(0, 3));
+  const first = attempt(candidate, base, FOLLOW_UP.slice(0, 3), context);
   const tools = request => toolMessages(request).map(message => message.content);
   let rewrites = 0;
   for (let index = 1; index < first.requests.length; index++) {
@@ -120,7 +138,7 @@ test('repaired projection keeps the sent prefix stable across calls and across t
   assert.ok(rewrites <= 1, `earlier sends were rewritten ${rewrites} times`);
   // The next owner turn (fresh attempt state) re-sends identical history bytes.
   const last = tools(first.requests.at(-1));
-  const next = attempt(candidate, first.messages, []);
+  const next = attempt(candidate, first.messages, [], context);
   assert.deepEqual(tools(next.requests[0]).slice(0, last.length), last);
   // The pinned projection re-trims at every attempt start instead.
   const pinned = attempt(original, base, FOLLOW_UP.slice(0, 3));

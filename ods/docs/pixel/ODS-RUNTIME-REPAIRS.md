@@ -261,6 +261,17 @@ projection (`truncateOversizedToolResultsInMessages`):
 - The choice depends only on transcript order. Calls between reductions and the
   next attempt re-send identical history bytes, so the prompt prefix changes
   about once per half-budget of new output instead of at every owner turn.
+- While a response is under way, a model with a context of 131k tokens or more
+  keeps twice the aggregate (128k characters) in view, reduced to half of that
+  in one step. On the laptop (2026-10-30), one 227-call elf-of-doom response
+  read all of the 1,929-line `ui.js` about nine times after its earlier reads
+  were reduced, while its prompt never went above 55k of 131k tokens.
+- The wider view lasts only while it fits the tool-loop guard below. The guard
+  measures this projection and counts tool text twice against window × 4 × 0.9
+  characters. From the first request at which the wider view would trip it, the
+  rest of the walk keeps the base aggregate, so the guard compacts where it did
+  without the wider view. A transcript that ends with a final reply, as the
+  pre-prompt compaction check sees it, is measured at the base aggregate.
 
 The session transcript, the pre-prompt compaction check and the recovery
 rewrite path are unchanged. `toolResultMaxChars` stays at 16k: doubling it on
