@@ -32,7 +32,7 @@ import { HOST_CITATION_LIMITS } from './citation-verification.mjs';
 import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
 import { answersClarification, clarificationAnswerContext } from "./pending-clarification.mjs";
-import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON } from "./run-progress-budget.mjs";
+import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT } from "./run-progress-budget.mjs";
 import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION, progressFinalizationHead,
   unverifiedLinksNote } from "./progress-finalization.mjs";
@@ -13039,6 +13039,11 @@ export function createToolLoopGuard({
     // The only mid-attempt channel to the live model; never on a stopped run.
     const deadlineNotice = state && !state.clientCancelled && !state.odsAborted
       ? takeRunDeadlineNotice(state.runDeadline, now()) : undefined;
+    // Same channel, once before the failure limits stop the run, so a change
+    // spread over several files is not left half made (laptop, 2026-10-30: the
+    // stop came during a chars.js edit and left unused cache code behind).
+    const progressWarning = state && !state.clientCancelled && !state.odsAborted &&
+      state.progressBudget.takeWarning() ? RUN_PROGRESS_WARNING_TEXT : undefined;
     const boundWebCall = pending &&
       (!state?.currentSessionId || sessionRuns.get(state.currentSessionId) === pending.runId) &&
       (!message.toolCallId || message.toolCallId === toolCallId) &&
@@ -13374,6 +13379,7 @@ export function createToolLoopGuard({
       !sandboxPathCorrection &&
       !executionGuidance &&
       !deadlineNotice &&
+      !progressWarning &&
       !exampleOutcome
     ) {
       return undefined;
@@ -13450,7 +13456,8 @@ export function createToolLoopGuard({
       });
     }
     if (exampleOutcome) content.push({type: 'text', text: EXAMPLE_NOTES[exampleOutcome].model});
-    // Last, and a block of its own: the per-result cap keeps short blocks whole.
+    // Last, and blocks of their own: the per-result cap keeps short blocks whole.
+    if (progressWarning) content.push({type: 'text', text: progressWarning});
     if (deadlineNotice) content.push({type: 'text', text: deadlineNotice});
     return {
       message: {

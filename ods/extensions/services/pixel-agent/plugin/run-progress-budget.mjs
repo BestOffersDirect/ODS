@@ -2,12 +2,36 @@ import { createHash } from 'node:crypto';
 
 // Independent of tool dispatch: the host can reject a call before plugin tool
 // hooks run. Model-round accounting must still bound that continuation loop.
+//
+// Failures count over the most recent charged results, not over the whole
+// response. A flat total of 12 per response stopped every long elf-of-doom
+// change on the laptop (2026-10-28 and 2026-10-30: 85, 140 and 226 calls) on
+// harmless misses spread across the run: searches that found nothing, a file
+// that was not there, an edit whose old text had changed. Those runs had at
+// most 9 failures in any 40 results; a stuck loop fails far more often.
 export const RUN_PROGRESS_LIMITS = Object.freeze({
   consecutiveFailures: 4,
-  totalFailures: 12,
+  recentFailures: 12,
+  recentResults: 40,
   roundsWithoutProgress: 8,
   identicalSuccesses: 2,
 });
+
+// The one notice before a stop (takeWarning): the streak or the recent
+// failures came within reach of their limit.
+export const RUN_PROGRESS_WARNING = Object.freeze({
+  consecutiveFailures: 3,
+  recentFailures: 8,
+});
+
+// Delivered at the end of a persisted tool result, never in the system prompt,
+// and byte-identical every time (see PR #6647, llama.cpp prefix caching). Its
+// marker differs from the stop's "[ODS Pixel tool limit]": tools still work.
+export const RUN_PROGRESS_WARNING_TEXT =
+  '[ODS Pixel failure warning] Several recent tool calls failed. If failures continue, Portal stops this response ' +
+  'and switches tools off, even in the middle of a change. If a change across several files is only partly made, ' +
+  'finish it now or undo the parts already made, so the saved project still works. Check a path before reading it, ' +
+  're-read the exact lines an edit replaces, and change approach instead of repeating a call that failed.';
 
 export const RUN_PROGRESS_STOP_REASON =
   'This response was stopped after repeated tool failures or attempts without progress. ' +
@@ -35,13 +59,22 @@ export function failedToolOutcome(event) {
 
 export function createRunProgressBudget() {
   let rounds = 0;
-  let failures = 0;
   let consecutiveFailures = 0;
   let terminal = false;
+  // Charged results, oldest first: true for a failure. Discovery never enters.
+  const recent = [];
+  let charged = 0;
+  let warnedAt;
   const seenCalls = new Set();
   const successes = new Map();
   const laneFailures = new Map();
   const exhaustedLanes = new Set();
+  const charge = failed => {
+    recent.push(failed);
+    if (recent.length > RUN_PROGRESS_LIMITS.recentResults) recent.shift();
+    charged += 1;
+  };
+  const recentFailures = () => recent.filter(Boolean).length;
   return {
     get exhausted() { return terminal; },
     // Another guard (the research web-loop terminal) stopped the response.
@@ -49,6 +82,18 @@ export function createRunProgressBudget() {
     stop() { terminal = true; },
     get exhaustedLanes() { return [...exhaustedLanes]; },
     laneExhausted(lane) { return exhaustedLanes.has(lane); },
+    // True when the run has come within reach of a failure limit and has not
+    // been warned in the last recentResults charged results. The caller
+    // delivers RUN_PROGRESS_WARNING_TEXT, so a change spread over several
+    // files can be finished or undone before tools are switched off.
+    takeWarning() {
+      if (terminal) return false;
+      const near = consecutiveFailures >= RUN_PROGRESS_WARNING.consecutiveFailures ||
+        recentFailures() >= RUN_PROGRESS_WARNING.recentFailures;
+      if (!near || (warnedAt !== undefined && charged - warnedAt < RUN_PROGRESS_LIMITS.recentResults)) return false;
+      warnedAt = charged;
+      return true;
+    },
     beginModelRound() {
       if (++rounds > RUN_PROGRESS_LIMITS.roundsWithoutProgress) terminal = true;
       return terminal;
@@ -59,7 +104,7 @@ export function createRunProgressBudget() {
       if (seenCalls.size > 256) seenCalls.delete(seenCalls.values().next().value);
       const classifiedLane = PROGRESS_LANES.has(lane) ? lane : undefined;
       if (failed) {
-        failures += 1;
+        charge(true);
         if (classifiedLane) {
           const count = (laneFailures.get(classifiedLane) ?? 0) + 1;
           laneFailures.set(classifiedLane, count);
@@ -67,16 +112,17 @@ export function createRunProgressBudget() {
         } else consecutiveFailures += 1;
         // A mixed task may retain its other lane, never an unlimited retry
         // allowance. Unknown calls retain the strict global consecutive fuse;
-        // every failure still consumes the unchanged total/global round caps.
+        // every failure still counts toward the recent-failure and round caps.
         terminal = exhaustedLanes.size === PROGRESS_LANES.size ||
           consecutiveFailures >= RUN_PROGRESS_LIMITS.consecutiveFailures ||
-          failures >= RUN_PROGRESS_LIMITS.totalFailures;
+          recentFailures() >= RUN_PROGRESS_LIMITS.recentFailures;
         return;
       }
       // Discovery changes the available schemas, not the task's outcome. A
       // successful search between failed actions must not erase their history
       // or let differently worded searches keep a run alive indefinitely.
       if (discovery || tool === 'tool_search' || tool === 'tool_describe' || tool === 'pixel_ods_skill') return;
+      charge(false);
       consecutiveFailures = 0;
       if (classifiedLane) laneFailures.set(classifiedLane, 0);
       // An actual running-process receipt is a verified wait, not a failure.
@@ -99,17 +145,20 @@ export function createRunProgressBudget() {
 // errors exit 2, git 128), and `which` exits 1 only when a name did not resolve.
 // Models also chain searches (`grep a f | head; echo ===; grep b g`), so a list
 // joined by `;` or `&&` qualifies when every step is a lookup, an echo, or sed
-// printing a line range, optionally piped into head, tail, cat, wc, sort or
-// uniq, and the last step is a bare lookup. None of the other steps can exit 1,
-// so exit 1 still means a search came up empty. OpenClaw merges stdout and
-// stderr, and an error in any step disqualifies the command. rg 13 prints some
-// errors with no recognisable prefix, so rg may only be the last step, where
-// its own exit status tells an error from an empty search. Options that run
-// programs or write files (rg --pre, git grep -O, sort -o, sed -i) disqualify it
-// too. One literal `cd DIR &&` may lead. Redirections, substitutions, `||`,
-// background jobs and escapes outside quotes stay ordinary failures, as does
-// every other exit code.
-const LOOKUP_CD = /^cd[ \t]+(?:'[^'\r\n]*'|"[^"$`\\\r\n]*"|[A-Za-z0-9._/-]+)[ \t]*&&[ \t]*/;
+// printing a line range, optionally piped into head, tail, cat, wc, sort, uniq,
+// grep, or sed printing a line range of what it is piped, and the last step is
+// a bare lookup. None of the other steps can exit 1, so exit 1 still means a
+// search came up empty. OpenClaw merges stdout and stderr, and an error in any
+// step disqualifies the command. rg 13 prints some errors with no recognisable
+// prefix, so rg may only be the last step, where its own exit status tells an
+// error from an empty search. Options that run programs or write files
+// (rg --pre, git grep -O, sort -o, sed -i) disqualify it too. One literal
+// `cd DIR &&` or `cd DIR;` may lead: a cd that fails prints the shell's error,
+// which disqualifies the command (laptop, 2026-10-30: seven empty searches,
+// most written `cd DIR; grep …`, were charged and helped stop the run).
+// Redirections, substitutions, `||`, background jobs and escapes outside
+// quotes stay ordinary failures, as does every other exit code.
+const LOOKUP_CD = /^cd[ \t]+(?:'[^'\r\n]*'|"[^"$`\\\r\n]*"|[A-Za-z0-9._/-]+)[ \t]*(?:&&|;)[ \t]*/;
 // GNU grep prints these on stderr for a search that still succeeded.
 const LOOKUP_NOTICE = /^[ef]?grep: (?:warning: .*|.*: binary file matches)$/gm;
 const LOOKUP_ERROR = new RegExp([
@@ -190,6 +239,11 @@ function isLookupCompanion([program, ...args]) {
 
 function isLookupSink([program, ...args]) {
   if (program === 'head' || program === 'tail') return /^(?:-(?:n ?\+?)?[1-9]\d*)?$/.test(args.join(' '));
+  // `grep -n "" ui.js | sed -n '560,600p'`: a line range of the piped text only.
+  if (program === 'sed') return args.length === 2 && args[0] === '-n' && /^[1-9]\d*(?:,[1-9]\d*)?p$/.test(args[1]);
+  // `grep -rn x *.js | grep function`: grep has no option that writes or runs
+  // anything, and its own errors carry its name.
+  if (['grep', 'egrep', 'fgrep'].includes(program)) return true;
   if (program === 'wc') return args.length === 1 && /^-[lwc]$/.test(args[0]);
   if (program === 'sort') return args.every(arg => /^-[bdfhinruV]+$/.test(arg));
   if (program === 'uniq') return args.every(arg => arg === '-c');
