@@ -8,6 +8,7 @@ import {createHash} from 'node:crypto';
 import {readFileSync} from 'node:fs';
 import {isAbsolute, join} from 'node:path';
 import {pathToFileURL} from 'node:url';
+import {isDeepStrictEqual} from 'node:util';
 
 const packageDir = process.env.OPENCLAW_PACKAGE_DIR;
 if (!packageDir || !isAbsolute(packageDir)) {
@@ -45,7 +46,8 @@ function load(source) {
   assert.equal(source.split(start).length, 2);
   const region = source.slice(source.indexOf(start), source.indexOf('\nexport {'));
   return new Function('normalizeLowercaseStringOrEmpty',
-    `${region}\nreturn {truncateOversizedToolResultsInMessages, createToolResultPromptProjectionState};`)(normalizeLowercaseStringOrEmpty);
+    `${region}\nreturn {truncateOversizedToolResultsInMessages, createToolResultPromptProjectionState,
+      liveGuardChars: typeof liveGuardChars === 'function' ? liveGuardChars : undefined};`)(normalizeLowercaseStringOrEmpty);
 }
 const original = load(originalSource);
 const candidate = load(candidateSource);
@@ -155,4 +157,68 @@ test('within the aggregate budget both projections send identical requests', () 
   id = start;
   const repaired = attempt(candidate, small, [2000, 500]);
   assert.deepEqual(repaired.requests.map(toolMessages), pinned.requests.map(toolMessages));
+});
+
+// The pinned tool-loop guard's own estimate (tool-result-context-guard). It
+// measures this projection, so the wider view must never let it see more than
+// window x 4 x 0.9 characters where the base projection would not.
+const selection = readFileSync(join(packageDir, 'dist/selection-BEwSQKM-.js'), 'utf8');
+const estimatorStart = '//#region src/agents/embedded-agent-runner/run/midturn-precheck.ts';
+const estimatorEnd = '//#region src/agents/embedded-agent-runner/tool-result-context-guard.ts';
+assert.ok(selection.split(estimatorStart).length === 2 && selection.split(estimatorEnd).length === 2);
+const {estimateMessageChars} = new Function(
+  `${selection.slice(selection.indexOf(estimatorStart), selection.indexOf(estimatorEnd))}\nreturn {estimateMessageChars};`)();
+const guardChars = messages => messages.reduce((sum, message) => sum + estimateMessageChars(message), 0);
+const GUARD_LIMIT = Math.floor(CONTEXT * 4 * 0.9);
+const image = {type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png'};
+
+test('the projection counts every message at least as the pinned guard does', () => {
+  const shapes = [
+    {role: 'user', content: 'plain owner text'},
+    {role: 'user', content: [{type: 'text', text: 'see this'}, image, {type: 'custom', value: 1}]},
+    {role: 'assistant', content: [{type: 'thinking', thinking: 'plan the cache'}, {type: 'text', text: 'Reading ui.js.'},
+      {type: 'toolCall', id: 'c1', name: 'write', arguments: {path: 'ui.js', content: 'x'.repeat(5000)}}, {type: 'other', n: 2}]},
+    {role: 'toolResult', toolCallId: 'c1', content: [{type: 'text', text: 'r'.repeat(6000)}, image]},
+    {role: 'toolResult', toolCallId: 'c2', content: 'string result'},
+    {role: 'tool', content: [{type: 'text', text: 'openai-style result'}]},
+    {role: 'custom', content: 'other role'},
+    {role: 'user', content: '游戏缓存'.repeat(500)},
+    {role: 'toolResult', toolCallId: 'c3', content: [{type: 'text', text: '敵のスプライト'.repeat(300)}]},
+  ];
+  for (const message of shapes) {
+    const pinned = estimateMessageChars(message), counted = candidate.liveGuardChars(message);
+    assert.ok(counted >= pinned, `${JSON.stringify(message).slice(0, 60)}: ${counted} < ${pinned}`);
+    if (!/[\u2E80-\u9FFF\uAC00-\uD7AF]/.test(JSON.stringify(message))) assert.equal(counted, pinned, JSON.stringify(message).slice(0, 60));
+  }
+});
+
+test('every request sends the wider view only within the pinned guard limit, otherwise the base projection', () => {
+  let seed = 20261030;
+  const random = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  let checked = 0, wider = 0, based = 0;
+  for (let response = 0; response < 24; response++) {
+    const messages = [{role: 'user', content: `owner ${'o'.repeat(Math.floor(random() * 4000))}`, timestamp: 0}];
+    const argChars = Math.floor(random() * 6000), resultChars = 1000 + Math.floor(random() * 15000);
+    for (let round = 0; round < 70; round++) {
+      const calls = Array.from({length: random() < 0.2 ? 2 : 1}, () => ({type: 'toolCall', id: `call_${++id}`, name: 'exec',
+        arguments: {command: 'x'.repeat(Math.floor(random() * argChars))}}));
+      messages.push({role: 'assistant', api: model.api, provider: model.provider, model: model.id, stopReason: 'toolUse', timestamp: id,
+        content: random() < 0.3 ? [{type: 'thinking', thinking: 't'.repeat(Math.floor(random() * 3000))}, ...calls] : calls});
+      for (const call of calls) {
+        const text = random() < 0.1 ? '画'.repeat(Math.floor(random() * resultChars / 3)) : 'r'.repeat(Math.floor(random() * resultChars));
+        messages.push({role: 'toolResult', toolCallId: call.id, toolName: 'exec', isError: false, timestamp: id,
+          content: random() < 0.15 ? [{type: 'text', text}, image] : [{type: 'text', text}]});
+      }
+      if (random() < 0.05) messages.push({role: 'user', content: `queued ${'q'.repeat(Math.floor(random() * 6000))}`, timestamp: id});
+      const sent = candidate.truncateOversizedToolResultsInMessages(messages, CONTEXT, MAX, 4 * MAX).messages;
+      const base = candidate.truncateOversizedToolResultsInMessages(messages, BASE_CONTEXT, MAX, 4 * MAX).messages;
+      checked++;
+      if (isDeepStrictEqual(sent, base)) based++;
+      else {
+        wider++;
+        assert.ok(guardChars(sent) <= GUARD_LIMIT, `response ${response} round ${round}: ${guardChars(sent)} in the wider view`);
+      }
+    }
+  }
+  assert.ok(wider > 100 && based > 100, JSON.stringify({checked, wider, based}));
 });

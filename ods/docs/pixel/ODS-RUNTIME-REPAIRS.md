@@ -272,8 +272,11 @@ projection (`truncateOversizedToolResultsInMessages`):
   is counted before it is reduced, and dense scripts are counted as OpenClaw's
   own estimate counts them (about one token per character). Otherwise the
   request sends exactly the base projection, so the guard trips at the same
-  request as without the wider view. A point that does not fit stays in every
-  longer transcript, so a response never returns to the wider view.
+  request as without the wider view. The provider stream's input can shrink
+  between its requests (old images are pruned, prompt context is dropped), so
+  once an attempt has declined the wider view it keeps the base projection
+  until the attempt ends. The next owner turn decides afresh, which can restore
+  results sent as notices once and rewrite that much of the cached prefix.
 - A transcript that ends with a final reply, as the pre-prompt compaction check
   sees it, is measured at the base aggregate. The first request of the next turn
   can send the wider view when it fits the guard, so its room for the reply

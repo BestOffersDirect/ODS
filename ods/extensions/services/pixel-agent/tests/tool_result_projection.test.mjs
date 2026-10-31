@@ -209,16 +209,41 @@ test('the wider view never makes the overflow guard trip sooner, and a response 
     history.push(write(5000), result(6000));
     const sent = assertGuardSafe(history, `round ${i}`, state);
     assert.equal(textOf(sent.at(-1)).length, 6000, `result ${i} delivered whole`);
+    // A queued owner message just big enough to pass the limit in the wider view.
+    const gap = GUARD_LIMIT - guardEstimate(sent);
+    if (!isDeepStrictEqual(sent, run(history).messages) && gap < 60000) {
+      const probe = [...history, {role: 'user', content: 'q'.repeat(gap + 1)}];
+      const probed = wide(probe).messages;
+      assert.ok(isDeepStrictEqual(probed, run(probe).messages) || guardEstimate(probed) <= GUARD_LIMIT,
+        `round ${i}: a queued message sent ${guardEstimate(probed)} in the wider view`);
+      state.probed = true;
+    }
     if (i % 7 === 3) {
       history.push({role: 'user', content: `Also keep the boss fight smooth. ${'y'.repeat(3000)}`});
       assertGuardSafe(history, `round ${i} queued message`, state);
     }
   }
-  assert.ok(state.widened && state.narrowed && state.tripped, JSON.stringify(state));
+  assert.ok(state.widened && state.narrowed && state.tripped && state.probed, JSON.stringify(state));
   // A reading response with little else keeps the wider view throughout.
   const reading = [{role: 'user', content: 'owner'}];
   for (let i = 0; i < 90; i++) turn(reading, 6000);
   assert.ok(inView(wide(reading).messages) > BUDGET);
+});
+
+test('once an attempt declines the wider view, it keeps the base projection though its input shrinks', () => {
+  // The provider stream passes one projection state per attempt. Between its
+  // requests OpenClaw prunes old images and drops prompt context, so the same
+  // transcript can arrive smaller; restoring results already sent as notices
+  // would rewrite the cached prompt prefix.
+  const big = [{role: 'user', content: `owner ${'p'.repeat(330000)}`}];
+  for (let i = 0; i < 16; i++) turn(big, 6000);
+  const shrunk = [{role: 'user', content: 'owner'}, ...big.slice(1)];
+  const attempt = {};
+  assert.deepEqual(realm(project(big, 131072, MAX, 4 * MAX, attempt), big).messages, run(big).messages);
+  assert.equal(attempt.liveWideDeclined, true);
+  assert.deepEqual(realm(project(shrunk, 131072, MAX, 4 * MAX, attempt), shrunk).messages, run(shrunk).messages);
+  // A new attempt decides afresh.
+  assert.ok(inView(wide(shrunk).messages) > inView(run(shrunk).messages));
 });
 
 test('dense scripts give up the wider view sooner, as OpenClaw counts them', () => {

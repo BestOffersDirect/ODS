@@ -155,6 +155,8 @@ test('the loop guard measures the projected prompt and leaves a small real promp
   // (openclaw-tool-result-projection.json): at most 128k characters plus the
   // newest result and the turn's own text, about 47k transport tokens.
   assert.ok(turns.every(body => transportTokens(body) < 48000), 'the provider prompts stayed small\n' + trace);
+  // The base aggregate alone stays near 25k (64k plus the newest result).
+  assert.ok(turns.some(body => transportTokens(body) > 30000), 'the wider view was in use\n' + trace);
 });
 
 // Positive control. The projection caps tool results only; tool-call arguments
