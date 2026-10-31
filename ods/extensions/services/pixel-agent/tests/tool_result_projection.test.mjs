@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
+import {isDeepStrictEqual} from 'node:util';
 import vm from 'node:vm';
 
 // The installed replacement runs against OpenClaw's own helpers. These stand-ins
@@ -174,34 +175,63 @@ const GUARD_LIMIT = Math.floor(131072 * 4 * 0.9);
 const guardEstimate = messages => messages.reduce((sum, m) => sum + (m.role === 'toolResult' ? 2 * textOf(m).length
   : m.role === 'assistant' ? m.content.reduce((chars, b) => chars + (b.type === 'toolCall' ? JSON.stringify(b.arguments ?? {}).length : b.text.length), 0)
   : m.content.length), 0);
+const write = (chars) => ({role: 'assistant', content: [{type: 'toolCall', id: `call-${nextId}`, name: 'write',
+  arguments: {path: 'Playground/game/ui.js', content: 'x'.repeat(chars)}}]});
 
-test('the wider view never trips the overflow guard where the base view would fit', () => {
-  // A long editing response: every round writes 5k of code and reads 6k.
+// The wider walk alone: at a huge window the guard limit is never reached.
+const unguarded = (messages) => realm(project(messages, 1e7, MAX, 4 * MAX, {}), messages);
+
+// Every request either fits the guard or sends exactly the base projection,
+// so the guard trips at the same request as without the wider view; once a
+// response has sent the base projection where the wider walk differs, it never
+// returns to the wider view.
+function assertGuardSafe(history, label, state) {
+  const sent = wide(history).messages;
+  const base = run(history).messages;
+  const wider = unguarded(history).messages;
+  const isBase = isDeepStrictEqual(sent, base);
+  assert.ok(isBase || isDeepStrictEqual(sent, wider), `${label}: neither the base nor the wider view`);
+  assert.ok(isBase || guardEstimate(sent) <= GUARD_LIMIT, `${label}: ${guardEstimate(sent)} sent in the wider view`);
+  if (state.narrowed) assert.ok(isBase, `${label}: back to the wider view`);
+  if (isBase && !isDeepStrictEqual(base, wider)) state.narrowed = true;
+  if (!isBase) state.widened = true;
+  if (guardEstimate(sent) > GUARD_LIMIT) state.tripped = true;
+  assert.equal(guardEstimate(sent) > GUARD_LIMIT, guardEstimate(base) > GUARD_LIMIT, `${label}: trips exactly where the base does`);
+  return sent;
+}
+
+test('the wider view never makes the overflow guard trip sooner, and a response never returns to it', () => {
+  // A long editing response: every round writes 5k of code and reads 6k, and
+  // now and then a queued owner message arrives between rounds.
   const history = [{role: 'user', content: 'owner'}];
-  let other = 'owner'.length, widened = 0, narrowedAt = -1;
+  const state = {};
   for (let i = 0; i < 90; i++) {
-    const args = {path: 'Playground/game/ui.js', content: 'x'.repeat(5000)};
-    history.push({role: 'assistant', content: [{type: 'toolCall', id: `call-${nextId}`, name: 'write', arguments: args}]}, result(6000));
-    other += JSON.stringify(args).length;
-    const sent = wide(history).messages;
-    const kept = inView(sent);
+    history.push(write(5000), result(6000));
+    const sent = assertGuardSafe(history, `round ${i}`, state);
     assert.equal(textOf(sent.at(-1)).length, 6000, `result ${i} delivered whole`);
-    if (kept > BUDGET) widened++;
-    // The wider view trims to half the doubled aggregate (64k); the base view
-    // to half the base (32k). A drop below 40k is the switch to the base view.
-    if (narrowedAt < 0 && widened && kept < BUDGET / 2 + 8000) narrowedAt = i;
-    if (narrowedAt >= 0) assert.ok(kept <= BUDGET, `round ${i}: ${kept} in view after narrowing at round ${narrowedAt}`);
-    // While the base aggregate fits under the guard, so does what is sent;
-    // where even the smallest wider view would not fit, the base view is sent.
-    if (other + 2 * BUDGET <= GUARD_LIMIT) assert.ok(guardEstimate(sent) <= GUARD_LIMIT, `round ${i}: ${guardEstimate(sent)}`);
-    if (other + 2 * (BUDGET - 8000) > GUARD_LIMIT) assert.ok(kept <= BUDGET, `round ${i}: ${kept} in view`);
+    if (i % 7 === 3) {
+      history.push({role: 'user', content: `Also keep the boss fight smooth. ${'y'.repeat(3000)}`});
+      assertGuardSafe(history, `round ${i} queued message`, state);
+    }
   }
-  assert.ok(widened >= 30, `the wider view was used (${widened} rounds)`);
-  assert.ok(narrowedAt > 0, 'and given up before the guard limit');
+  assert.ok(state.widened && state.narrowed && state.tripped, JSON.stringify(state));
   // A reading response with little else keeps the wider view throughout.
   const reading = [{role: 'user', content: 'owner'}];
   for (let i = 0; i < 90; i++) turn(reading, 6000);
   assert.ok(inView(wide(reading).messages) > BUDGET);
+});
+
+test('dense scripts give up the wider view sooner, as OpenClaw counts them', () => {
+  // About one token per character: 128k characters of it would fill the window.
+  const dense = [{role: 'user', content: 'owner'}];
+  const latin = [{role: 'user', content: 'owner'}];
+  for (let i = 0; i < 40; i++) {
+    turn(dense, {...result(0), content: [{type: 'text', text: '游戏'.repeat(3000)}]});
+    turn(latin, 6000);
+  }
+  assert.ok(inView(wide(latin).messages) > BUDGET);
+  const sent = wide(dense).messages;
+  assert.deepEqual(sent, run(dense).messages);
 });
 
 test('a transcript that ends with a final reply keeps the base aggregate the compaction check measures', () => {

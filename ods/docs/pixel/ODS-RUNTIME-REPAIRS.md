@@ -266,12 +266,18 @@ projection (`truncateOversizedToolResultsInMessages`):
   in one step. On the laptop (2026-10-30), one 227-call elf-of-doom response
   read all of the 1,929-line `ui.js` about nine times after its earlier reads
   were reduced, while its prompt never went above 55k of 131k tokens.
-- The wider view lasts only while it fits the tool-loop guard below. The guard
-  measures this projection and counts tool text twice against window × 4 × 0.9
-  characters. From the first request at which the wider view would trip it, the
-  rest of the walk keeps the base aggregate, so the guard compacts where it did
-  without the wider view. A transcript that ends with a final reply, as the
-  pre-prompt compaction check sees it, is measured at the base aggregate.
+- A request gets the wider view only when it fits the tool-loop guard below at
+  every message of the transcript. The guard measures this projection and
+  counts tool text twice against window × 4 × 0.9 characters. The newest batch
+  is counted before it is reduced, and dense scripts are counted as OpenClaw's
+  own estimate counts them (about one token per character). Otherwise the
+  request sends exactly the base projection, so the guard trips at the same
+  request as without the wider view. A point that does not fit stays in every
+  longer transcript, so a response never returns to the wider view.
+- A transcript that ends with a final reply, as the pre-prompt compaction check
+  sees it, is measured at the base aggregate. The first request of the next turn
+  can send the wider view when it fits the guard, so its room for the reply
+  rests on the loop guard rather than on the pre-prompt check's reserve.
 
 The session transcript, the pre-prompt compaction check and the recovery
 rewrite path are unchanged. `toolResultMaxChars` stays at 16k: doubling it on
