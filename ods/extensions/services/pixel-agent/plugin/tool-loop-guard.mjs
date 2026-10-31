@@ -32,7 +32,7 @@ import { HOST_CITATION_LIMITS } from './citation-verification.mjs';
 import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
 import { answersClarification, clarificationAnswerContext } from "./pending-clarification.mjs";
-import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT } from "./run-progress-budget.mjs";
+import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, readOnlyLookup, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT } from "./run-progress-budget.mjs";
 import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION, progressFinalizationHead,
   unverifiedLinksNote } from "./progress-finalization.mjs";
@@ -255,6 +255,19 @@ export const FREE_NODE_RESULTS_PER_RUN = 12;
 // verification), so in the direct transport the same command may run again
 // after it, as before; the Tool Search transport ends coding tools instead.
 export const FREE_REPEAT_COMMANDS_PER_RUN = 12;
+
+// After every this many reads (read calls, and exec commands that only read
+// files: run-progress-budget.mjs readOnlyLookup) in a response that has not
+// changed a file with write, edit or apply_patch yet, one
+// fixed notice asks the model to record what it needs and start changing files;
+// at most EDIT_EARLY_NOTICES per response. On the laptop (2026-10-30) a
+// 227-call elf-of-doom run never edited: by the time it reached the end of
+// ui.js, the tool-result projection had dropped the start, and it read again.
+// The notice also covers a request that only asked for an explanation.
+export const EDIT_EARLY_READS = 30;
+export const EDIT_EARLY_NOTICES = 2;
+export const EDIT_EARLY_NOTICE =
+  "[ODS Pixel next step] Many tool calls in this response have read files, and none has changed one with write, edit or apply_patch. In a long response Portal replaces older tool output with a short notice, so more reading can push out what you read first. If the owner asked for a change, keep the facts you need in the explanation of update_plan and make the first change now, reading further only for the exact lines you are about to change. If the owner asked only for an explanation or a review, answer from what you have read.";
 
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
@@ -8465,6 +8478,13 @@ export function createToolLoopGuard({
         invalidExecArgumentAttempts: 0,
         successfulExec: new Map(),
         successfulExecBlocks: new Map(),
+        // Reads in this response, whether a write, edit or apply_patch has
+        // succeeded yet, and the EDIT_EARLY_NOTICE deliveries (count, and the
+        // reads at the last one).
+        readsSinceChange: 0,
+        fileChangedThisRun: false,
+        editEarlyNotices: 0,
+        editEarlyAt: 0,
         failedVerificationAttempts: 0,
         latestVerificationStatus: undefined,
         latestVerificationFingerprint: undefined,
@@ -8593,6 +8613,28 @@ export function createToolLoopGuard({
   function finalizationInstruction(state) {
     return state.progressStoppedByPreviewCheck && state.workspacePreview
       ? PREVIEW_CHECK_FINALIZATION_INSTRUCTION : PROGRESS_FINALIZATION_INSTRUCTION;
+  }
+
+  // EDIT_EARLY_NOTICE is due every EDIT_EARLY_READS reads, at most
+  // EDIT_EARLY_NOTICES times per response. Only before this response changed
+  // any file, so its wording holds, and not once a time-limit notice said to
+  // start no new work.
+  function takeEditEarlyNotice(state) {
+    if (!longTaskWork(state) || state.fileChangedThisRun || state.runDeadline?.notices > 0 ||
+        extensionDiscoveryActive(state)) return false;
+    if (state.editEarlyNotices >= EDIT_EARLY_NOTICES || state.readsSinceChange - state.editEarlyAt < EDIT_EARLY_READS) return false;
+    state.editEarlyNotices += 1;
+    state.editEarlyAt = state.readsSinceChange;
+    return true;
+  }
+
+  // Ordinary workspace work, which the long-task line (prompt-contract.mjs
+  // longTaskContract) and EDIT_EARLY_NOTICE are for. Operations, managed
+  // extension requests and exact downloads keep their own tool boundaries,
+  // which refuse update_plan; team roles that plan or review cannot edit.
+  function longTaskWork(state) {
+    return Boolean(state) && !state.operationsRequired && !state.exactDownloadRequested &&
+      !state.extensionCompletionGate?.active && !state.managedTeamReadOnly && !state.managedTeamCoordinator;
   }
 
   // Charges one tool result to the progress budget and remembers a failed
@@ -9454,8 +9496,10 @@ export function createToolLoopGuard({
           .slice(continuationDirectory.length + 1)
           .split("/")
           .every((part) => WORKSPACE_PATH_COMPONENT.test(part));
+      // update_plan has no workspace effect; long fixes keep their notes in it
+      // (ODS_LONG_TASK_CONTRACT, EDIT_EARLY_NOTICE).
       if (
-        (!["read", "write", "edit", "exec", "process", "tool_search", "tool_describe", WORKSPACE_PREVIEW_TOOL, PREVIEW_INSPECTION_TOOL, WORKSPACE_BUNDLE_TOOL].includes(selectedToolName) &&
+        (!["read", "write", "edit", "exec", "process", "tool_search", "tool_describe", "update_plan", WORKSPACE_PREVIEW_TOOL, PREVIEW_INSPECTION_TOOL, WORKSPACE_BUNDLE_TOOL].includes(selectedToolName) &&
           !(state.workspaceExtensionIsolated && EXTENSION_METADATA_TOOLS.has(selectedToolName))) ||
         (FILE_PATH_TOOLS.has(selectedToolName) && !insideContinuationDirectory)
       ) {
@@ -11540,6 +11584,12 @@ export function createToolLoopGuard({
     const refusedCall = state.previewRevalidationRefusedCalls?.delete(toolCallId) === true && failedToolOutcome(event);
     const noWorkspaceEffect = refusedCall || workspaceReadOnlyCall(toolName, event?.params);
     if (!noWorkspaceEffect) state.previewVerificationGeneration = (state.previewVerificationGeneration ?? 0) + 1;
+    // Counted for EDIT_EARLY_NOTICE: reads, and commands that only read files
+    // (the model's own command, from the pending record), on the outer call
+    // only, because a nested Tool Search execution reports the same action again.
+    const readingTool = toolName === 'tool_call' ? String(event?.params?.id ?? '').split(':').at(-1) : toolName;
+    if (!String(toolCallId).startsWith('tool_search_code:') && (readingTool === 'read' ||
+        (readingTool === 'exec' && readOnlyLookup(pendingToolRun?.selectedParams?.command)))) state.readsSinceChange += 1;
     // Nested Tool Search executions also emit hooks. Count only the outer
     // call (or an ordinary direct call), never both receipts for one action.
     if ((event?.result || event?.error) && !String(toolCallId).startsWith('tool_search_code:')) {
@@ -11665,6 +11715,7 @@ export function createToolLoopGuard({
         : undefined;
     if (successfulMutation) {
       state.workspaceMutationObserved = true;
+      state.fileChangedThisRun = true;
       state.invalidEditCreateBlocks = 0;
       state.oversizedEditBlocks = 0;
       state.noOpEditBlocks = 0;
@@ -13064,6 +13115,10 @@ export function createToolLoopGuard({
     // or a question to the owner is waiting.
     const progressWarning = state && !state.clientCancelled && !state.odsAborted && !state.codingExhausted &&
       !state.ownerQuestions && state.progressBudget.takeWarning() ? RUN_PROGRESS_WARNING_TEXT : undefined;
+    // Same channel: after many reads and no file change, one push to record
+    // what is needed and start changing files.
+    const editEarlyNotice = state && !state.clientCancelled && !state.odsAborted && !state.progressBudget.exhausted &&
+      takeEditEarlyNotice(state) ? EDIT_EARLY_NOTICE : undefined;
     const boundWebCall = pending &&
       (!state?.currentSessionId || sessionRuns.get(state.currentSessionId) === pending.runId) &&
       (!message.toolCallId || message.toolCallId === toolCallId) &&
@@ -13400,6 +13455,7 @@ export function createToolLoopGuard({
       !executionGuidance &&
       !deadlineNotice &&
       !progressWarning &&
+      !editEarlyNotice &&
       !exampleOutcome
     ) {
       return undefined;
@@ -13478,6 +13534,7 @@ export function createToolLoopGuard({
     if (exampleOutcome) content.push({type: 'text', text: EXAMPLE_NOTES[exampleOutcome].model});
     // Last, and blocks of their own: the per-result cap keeps short blocks whole.
     if (progressWarning) content.push({type: 'text', text: progressWarning});
+    if (editEarlyNotice) content.push({type: 'text', text: editEarlyNotice});
     if (deadlineNotice) content.push({type: 'text', text: deadlineNotice});
     return {
       message: {
@@ -14814,6 +14871,7 @@ export function createToolLoopGuard({
       return {schemaVersion:1,kind:'ods-extension-unfinished-decision',eligible:true,
         chatId:observed.chatId,requestId:observed.requestId};
     },
+    longTaskEligible: (runId) => longTaskWork(runs.get(runId)),
     continuationAllowed: (runId) => {
       const state=runs.get(runId);
       return Boolean(state && !state.clientCancelled && !state.progressBudget.exhausted

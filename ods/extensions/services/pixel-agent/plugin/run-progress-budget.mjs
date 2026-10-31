@@ -273,6 +273,36 @@ function isLookupSink([program, ...args]) {
   return program === 'cat' && args.length === 0;
 }
 
+// The edit-early notice in tool-loop-guard.mjs counts commands that only read
+// files, whatever they returned: the lookup shape above, or a file read (cat,
+// head, tail, nl, wc, a sed range print), piped through filters (the sinks
+// above, grep, a sed range print), with a trailing 2>&1. Never a command that
+// can write: redirections, tee, sed -i or a sed w command, sort -o.
+const SED_RANGE_PRINT = /^(?:\d+|\/[^/\\]*\/)(?:,(?:\d+|\/[^/\\]*\/|\$))?p$/;
+function isFileRead([program, ...args]) {
+  const options = args.filter(arg => arg.startsWith('-'));
+  if (options.length === args.length) return false;
+  if (program === 'cat') return options.every(arg => arg === '-n');
+  if (program === 'head' || program === 'tail') return options.every(arg => /^-n?\d*$/.test(arg) && arg !== '-');
+  if (program === 'nl') return options.every(arg => arg === '-ba');
+  if (program === 'wc') return options.every(arg => /^-[lwc]$/.test(arg));
+  return program === 'sed' && args[0] === '-n' && SED_RANGE_PRINT.test(args[1] ?? '') &&
+    args.length > 2 && args.slice(2).every(arg => !arg.startsWith('-'));
+}
+function isReadFilter(stage) {
+  const [program, ...args] = stage;
+  if (['grep', 'egrep', 'fgrep'].includes(program)) return true;
+  if (program === 'sed') return args.length === 2 && args[0] === '-n' && SED_RANGE_PRINT.test(args[1]);
+  return isLookupSink(stage);
+}
+export function readOnlyLookup(command) {
+  if (typeof command !== 'string' || command.length > 4096) return false;
+  const steps = lookupSteps(command.trim().replace(LOOKUP_CD, ''), {mergeStderr: true});
+  return Boolean(steps) && steps.every(([first, ...filters]) =>
+    (isLookup(first) || isLookupCompanion(first) || isFileRead(first)) && filters.every(isReadFilter)) &&
+    steps.some(([[program]]) => program !== 'echo');
+}
+
 export function lookupFoundNothing(command, result) {
   if (typeof command !== 'string' || command.length > 4096) return false;
   const steps = lookupSteps(command.trim().replace(LOOKUP_CD, ''));
