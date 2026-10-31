@@ -32,7 +32,7 @@ import { HOST_CITATION_LIMITS } from './citation-verification.mjs';
 import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
 import { answersClarification, clarificationAnswerContext } from "./pending-clarification.mjs";
-import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON } from "./run-progress-budget.mjs";
+import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT } from "./run-progress-budget.mjs";
 import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION, progressFinalizationHead,
   unverifiedLinksNote } from "./progress-finalization.mjs";
@@ -7980,7 +7980,7 @@ export function createToolLoopGuard({
   // blocked receipt that after_tool_call and tool_result_persist report later.
   // Beyond that bound the same answer is charged as an ordinary blocked
   // result, so a model that keeps repeating the call still reaches the
-  // unchanged consecutive/total failure fuses. A nested Tool Search execution
+  // unchanged consecutive and recent failure fuses. A nested Tool Search execution
   // is charged through its outer tool_call receipt, whose ID differs, so it
   // never receives the allowance. Returns whether this answer was free.
   function recordFreeCorrection(state, kind, callId, toolName, limit = FREE_CORRECTIONS_PER_KIND) {
@@ -11203,8 +11203,9 @@ export function createToolLoopGuard({
     else if (state.compactionWindow?.calls.size === 0) state.compactionWindow = undefined;
     // The summary can drop a delivered run-deadline notice (keepRecentTokens
     // is 8192 on a 131K model), so the stage now due is sent again, with the
-    // same bytes, on the next persisted result.
+    // same bytes, on the next persisted result. The failure warning likewise.
     if (phase === "end" && state.runDeadline) state.runDeadline.notices = 0;
+    if (phase === "end") state.progressBudget.rearmWarning();
   }
 
   function observeModelCall(event, context, agentId = "pixel") {
@@ -13039,6 +13040,13 @@ export function createToolLoopGuard({
     // The only mid-attempt channel to the live model; never on a stopped run.
     const deadlineNotice = state && !state.clientCancelled && !state.odsAborted
       ? takeRunDeadlineNotice(state.runDeadline, now()) : undefined;
+    // Same channel, once before the failure limits stop the run, so a change
+    // spread over several files is not left half made (laptop, 2026-10-30: the
+    // stop came during a chars.js edit and left unused cache code behind).
+    // Not where tools are already done for this response: coding tools ended,
+    // or a question to the owner is waiting.
+    const progressWarning = state && !state.clientCancelled && !state.odsAborted && !state.codingExhausted &&
+      !state.ownerQuestions && state.progressBudget.takeWarning() ? RUN_PROGRESS_WARNING_TEXT : undefined;
     const boundWebCall = pending &&
       (!state?.currentSessionId || sessionRuns.get(state.currentSessionId) === pending.runId) &&
       (!message.toolCallId || message.toolCallId === toolCallId) &&
@@ -13374,6 +13382,7 @@ export function createToolLoopGuard({
       !sandboxPathCorrection &&
       !executionGuidance &&
       !deadlineNotice &&
+      !progressWarning &&
       !exampleOutcome
     ) {
       return undefined;
@@ -13450,7 +13459,8 @@ export function createToolLoopGuard({
       });
     }
     if (exampleOutcome) content.push({type: 'text', text: EXAMPLE_NOTES[exampleOutcome].model});
-    // Last, and a block of its own: the per-result cap keeps short blocks whole.
+    // Last, and blocks of their own: the per-result cap keeps short blocks whole.
+    if (progressWarning) content.push({type: 'text', text: progressWarning});
     if (deadlineNotice) content.push({type: 'text', text: deadlineNotice});
     return {
       message: {
