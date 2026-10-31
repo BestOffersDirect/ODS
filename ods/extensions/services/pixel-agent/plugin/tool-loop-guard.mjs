@@ -166,7 +166,7 @@ export const CODING_RETRY_EXHAUSTED_REASON =
   "Pixel stopped a no-progress coding repair loop after its bounded failed-verification limit. Do not call another tool in this turn. Give the user a visible summary of the verified failure, the changes attempted, and the most useful next step.";
 
 export const CODING_REPEAT_NO_PROGRESS_REASON =
-  "That exact command already succeeded twice without a workspace mutation. Do not run it again. Perform the requested change with write, edit, or apply_patch, choose a materially different command, or give the owner a visible blocker.";
+  "That exact command already succeeded twice in this response without a write, edit, or apply_patch since, so Portal did not run it again. Its earlier output may have left your view: in a long response Portal replaces older tool output with a short notice. Read only the lines you need (search for a name, then print a short range), keep the facts you still need (file, line numbers, names) in the explanation of update_plan, and perform the requested change with write, edit, or apply_patch, or give the owner a visible blocker.";
 
 export const CODING_LOOP_ABORT_REASON =
   "Pixel stopped this response because it requested another coding tool after the repeated-command limit was reached. Start a fresh message to continue from the preserved workspace with a different approach.";
@@ -243,6 +243,18 @@ export const FREE_EMPTY_LOOKUPS_PER_RUN = 12;
 // lookups they never reset the round fuse, and the same failing command three
 // times without an edit is still refused (failedExecRetries).
 export const FREE_NODE_RESULTS_PER_RUN = 12;
+
+// Per run: how many refusals of an identical read-only command that already
+// succeeded twice (CODING_REPEAT_NO_PROGRESS_REASON) are recorded as advice
+// instead of failures. Nothing ran, and the model mostly asks again because the
+// earlier output left its view: past its budget the tool-result projection
+// replaces older output with a notice (laptop, 2026-10-30: four of the thirteen
+// failures charged in a 227-call elf-of-doom run were these refusals, after its
+// reads of ui.js had been dropped from the prompt). The refusal's receipt keeps
+// its existing bookkeeping (a refused test run still counts as a failed
+// verification), so in the direct transport the same command may run again
+// after it, as before; the Tool Search transport ends coding tools instead.
+export const FREE_REPEAT_COMMANDS_PER_RUN = 12;
 
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
@@ -10595,6 +10607,8 @@ export function createToolLoopGuard({
         const blocks = state.successfulExecBlocks.get(fingerprint) ?? 0;
         if (blocks === 0) {
           state.successfulExecBlocks.set(fingerprint, 1);
+          recordFreeCorrection(state, "repeat-command", context?.toolCallId ?? event?.toolCallId, toolName,
+            FREE_REPEAT_COMMANDS_PER_RUN);
           return { block: true, blockReason: CODING_REPEAT_NO_PROGRESS_REASON };
         }
         state.codingExhausted = true;
