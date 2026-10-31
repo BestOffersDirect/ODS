@@ -40,10 +40,10 @@ const CUT_OFF = {success: false, durationMs: minutes(30), messages: [
   {role: 'assistant', stopReason: 'aborted', content: []},
 ]};
 
-function fixture({context = OWNER, capabilities = CAPABILITIES, prompt = PROMPT} = {}) {
+function fixture({context = OWNER, capabilities = CAPABILITIES, prompt = PROMPT, goal = false} = {}) {
   let clock = 0;
   const aborts = [];
-  const guard = createToolLoopGuard({now: () => clock,
+  const guard = createToolLoopGuard({now: () => clock, goalRun: () => goal,
     abortRun: sessionId => { aborts.push(sessionId); return true; },
     abortRunAndDrain: async () => ({aborted: true, drained: true})});
   const begin = () => guard.observeRun(context, 'pixel', {prompt}, capabilities);
@@ -339,7 +339,8 @@ async function close(server) {
 
 for (const stream of [false, true]) for (const published of [false, true])
 test(`Portal receives the ODS stop over the real ingress, stream=${stream}, published=${published}`, async t => {
-  const f = fixture({prompt: published ? `${PROMPT} Publish the game preview when it works.` : PROMPT});
+  // As a /goal round: its outcome also says which limit stopped it.
+  const f = fixture({prompt: published ? `${PROMPT} Publish the game preview when it works.` : PROMPT, goal: true});
   f.edit();
   const url = published ? f.publish() : undefined;
   const expected = published ? `${STOP_COPY}\n\n${changed('game/ui.js', 'game/index.html')}\n\n[Open last published preview](${url})\n\n` +
@@ -386,5 +387,6 @@ test(`Portal receives the ODS stop over the real ingress, stream=${stream}, publ
     : JSON.parse(body).choices[0].message.content;
   assert.equal(text, expected);
   assert.doesNotMatch(body, /timeoutSeconds|LLM request failed/);
-  if (stream) assert.equal(frames.at(-1).pixel_outcome.status, 'failed');
+  // Goal mode's controller continues a goal after this stop (dashboard-api portal_goal.py).
+  if (stream) assert.deepEqual(frames.at(-1).pixel_outcome, {schemaVersion: 1, status: 'failed', stop: 'run-deadline'});
 });
