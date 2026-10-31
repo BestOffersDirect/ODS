@@ -33,7 +33,7 @@ import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
 import { answersClarification, clarificationAnswerContext } from "./pending-clarification.mjs";
 import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, nodeReportedFailure, progressLaneStopReason, readOnlyLookup, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT } from "./run-progress-budget.mjs";
-import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
+import { assistantMessageText, changedFilesNote, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION, progressFinalizationHead,
   unverifiedLinksNote } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
@@ -268,6 +268,10 @@ export const EDIT_EARLY_READS = 30;
 export const EDIT_EARLY_NOTICES = 2;
 export const EDIT_EARLY_NOTICE =
   "[ODS Pixel next step] Many tool calls in this response have read files, and none has changed one with write, edit or apply_patch. In a long response Portal replaces older tool output with a short notice, so more reading can push out what you read first. If the owner asked for a change, keep the facts you need in the explanation of update_plan and make the first change now, reading further only for the exact lines you are about to change. If the owner asked only for an explanation or a review, answer from what you have read.";
+
+// Per response: files kept for the stop's list of changed files
+// (changedFilesNote). Past this the list undercounts what it does not name.
+export const MAX_CHANGED_FILES_RECORDED = 256;
 
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
@@ -796,6 +800,16 @@ function normalizeWorkspaceFilePath(value) {
     value = value.slice("workspace/".length);
   }
   return value.replace(/^(?:\.\/)+/, "");
+}
+
+// A path under the configured workspace root (a native run's absolute path)
+// spelled relative to it, with inner "./" segments dropped; any other value
+// unchanged. For listing only, never for scope checks.
+function workspaceRelativeSpelling(file, root) {
+  if (typeof file !== "string") return file;
+  const base = typeof root === "string" ? root.replace(/\/+$/, "") : "";
+  const relative = base && file.startsWith(`${base}/`) ? file.slice(base.length + 1) : file;
+  return relative.replace(/\/(?:\.\/)+/g, "/");
 }
 
 // A normalized workspace-relative file path, or undefined for absolute,
@@ -8361,6 +8375,9 @@ export function createToolLoopGuard({
         successfulWritePaths: new Set(),
         boundPreviewWriteDirectories: new Set(),
         successfulEditPaths: new Set(),
+        // Every file a successful write, edit or apply_patch changed in this
+        // response, in order (changedFilesNote); bounded by MAX_CHANGED_FILES_RECORDED.
+        changedFiles: new Set(),
         successfulWriteContentByPath: new Map(),
         compareSwapRepairCounts: new Map(),
         successfulReadPaths: new Set(),
@@ -11925,6 +11942,11 @@ export function createToolLoopGuard({
       : undefined;
     if (successfulMutation) {
       for (const file of workspaceMutationFiles(successfulMutation.name,successfulMutation.event?.params)) {
+        // Listed by its workspace-relative path only; other absolute or
+        // traversing spellings are left out.
+        const changedPath = derivedWorkspacePath(normalizeWorkspaceFilePath(
+          workspaceRelativeSpelling(file, state.configuredWorkspaceRoot)));
+        if (changedPath && state.changedFiles.size < MAX_CHANGED_FILES_RECORDED) state.changedFiles.add(changedPath);
         if (state.latestStandaloneUnittest?.relativePath === normalizeWorkspaceFilePath(file)) {
           state.latestVerificationStatus = undefined;
           state.latestStandaloneUnittest = undefined;
@@ -14258,7 +14280,9 @@ export function createToolLoopGuard({
             },
           }, {text, rest: link, note: state.codingExhausted ? PREVIEW_STOPPED_NOTE : PREVIEW_EARLIER_NOTE});
         }
-        const hasIndexEvidence = [
+        // Files this response changed by any file tool also count: the stop's
+        // list of changed files must not sit beside "didn't create the files".
+        const hasIndexEvidence = state.changedFiles.size > 0 || [
           ...state.successfulWritePaths,
           ...state.successfulReadPaths,
         ].some(
@@ -14582,6 +14606,11 @@ export function createToolLoopGuard({
       delete result.deliveryMode;
     }
     if (owner) result=explainedPreviewDelivery(result, owner);
+    // A stop's text, in the owner's wording, stays within what the ingress
+    // accepts (parseVerificationResponse); past it the owner got no reply. A
+    // long tool-limit answer with unread links and changed files could reach it.
+    if (result.status === 'failed' && result.text?.length > MAX_INGRESS_VERIFICATION_TEXT)
+      result = {...result, text: result.text.slice(0, MAX_INGRESS_VERIFICATION_TEXT)};
     // The shipped example's one owner line, which Portal's ingress adds after
     // the reply it delivers (host/pixel_ingress.mjs). A pending question card
     // carries none.
@@ -14625,6 +14654,7 @@ export function createToolLoopGuard({
       // published, already links that preview and says what it does not prove.
       const preview = failure?.preview ? undefined : progressStopPreview(state);
       return {status: 'failed', text: [runDeadlineStopText(state.runDeadline, state.workspaceMutationObserved),
+        changedFilesNote([...state.changedFiles]),
         preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
         failure && ownerOutcomeText(failure)].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
       ...(failure?.preview ? {preview: failure.preview}
@@ -14656,6 +14686,7 @@ export function createToolLoopGuard({
     if (state?.progressBudget.exhausted) {
       const preview = progressStopPreview(state);
       const receipt = preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {};
+      const changed = changedFilesNote([...state.changedFiles]);
       // The request is still incomplete ('failed'); only the finalization
       // turn's validated answer replaces the canned stop text, followed by
       // host facts that the model cannot alter.
@@ -14671,13 +14702,14 @@ export function createToolLoopGuard({
           refusedToolCalls: state.progressFinalization.partial,
           requestedTextMissing: requestedTextDeliveryNote(preview, state.workspaceRequestedTextCheck,
             state.workspaceControlNameCheck),
+          changedFiles: [...state.changedFiles],
           ...(modelAnswer ? {} : {synthesis: {note: STOP_SYNTHESIS_NOTE, pages: synthesized.pages}})});
         // A website build's owner reads the answer, then Portal's line in
-        // place of the stop facts after it; links the answer cites without a
-        // read receipt, and a host synthesis's source, stay said. A partial
-        // answer (its calls were refused) or one that announces more work
-        // ends unfinished.
-        const stop = progressStopPresentation(state, verification, [unverifiedLinksNote(unverified),
+        // place of the stop facts after it; the files it changed, links the
+        // answer cites without a read receipt, and a host synthesis's source,
+        // stay said. A partial answer (its calls were refused) or one that
+        // announces more work ends unfinished.
+        const stop = progressStopPresentation(state, verification, [changed, unverifiedLinksNote(unverified),
           ...(modelAnswer ? [] : [STOP_SYNTHESIS_NOTE, composeReadPages(synthesized.pages)])],
         {continues: state.progressFinalization.partial || announcesMoreWork(answer)});
         const result = {status: 'failed', text, ...receipt};
@@ -14692,12 +14724,12 @@ export function createToolLoopGuard({
       const pages = readPages ? `\n\n${readPages}` : '';
       // Without an answer, a research-loop stop keeps its specific text.
       if (state.researchStopped) return {status: 'failed', text: WEB_LOOP_DELIVERY_REASON + pages, ...receipt};
-      const text = RUN_PROGRESS_STOP_REASON + (preview
+      const text = RUN_PROGRESS_STOP_REASON + (changed ? `\n\n${changed}` : '') + (preview
         ? `\n\n[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.` : '') +
         pages;
       // A website build's owner reads Portal's line and the preview card, or
       // what there is and what to do next, in place of this stop text.
-      const stop = progressStopPresentation(state, verification, [readPages]);
+      const stop = progressStopPresentation(state, verification, [changed, readPages]);
       return stop ? previewOutcome({status: 'failed', text, ...receipt}, {...stop, text})
         : {status: 'failed', text, ...receipt};
     }
