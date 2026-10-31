@@ -27,7 +27,7 @@ import {PREVIEW_CONTINUE_NOTE, PREVIEW_INCOMPLETE_NOTE, PREVIEW_STOPPED_NOTE,
   PREVIEW_UNFINISHED_NOTE} from '../plugin/preview-explanation.mjs';
 import {PREVIEW_CHECK_FINALIZATION_INSTRUCTION, PROGRESS_FINALIZATION_INSTRUCTION,
   PROGRESS_FINALIZATION_NOTE} from '../plugin/progress-finalization.mjs';
-import {RUN_PROGRESS_LIMITS, RUN_PROGRESS_STOP_REASON} from '../plugin/run-progress-budget.mjs';
+import {RUN_PROGRESS_LIMITS, RUN_PROGRESS_STOP_REASON, RUN_PROGRESS_WARNING_TEXT} from '../plugin/run-progress-budget.mjs';
 
 const USER = 'ods-' + '5f0'.repeat(21) + 'a';
 const runId = 'chatcmpl_5f0a7c11-2d3e-4f50-8a61-7b8c9d0e1f2a';
@@ -149,8 +149,11 @@ const receiptOf = guard => {
 
 test('Spark stopwatch: the check that stops the run tells the model to stop checking and wrap up', async () => {
   const {guard, inspections, persisted, call, persist, round, aborts} = await stopwatchTurn();
-  // The first two checks reach the model unchanged; they did not stop the run.
-  assert.deepEqual(inspections.slice(0, 2).map(item => item.persisted), inspections.slice(0, 2).map(item => item.result.content[0].text));
+  // The first two checks reach the model with their own text; they did not stop
+  // the run. The second, the third failure in a row, also carries the one
+  // warning that comes before the stop.
+  assert.equal(inspections[0].persisted, inspections[0].result.content[0].text);
+  assert.equal(inspections[1].persisted, `${inspections[1].result.content[0].text}\n${RUN_PROGRESS_WARNING_TEXT}`);
   // The third one stopped it: its persisted result, which the next model request
   // carries, is the wrap-up instruction instead of the stop text.
   assert.equal(inspections[2].persisted, PREVIEW_CHECK_FINALIZATION_INSTRUCTION);
@@ -243,7 +246,7 @@ test('a stopped build with no preview says so plainly, with what there is, the n
 });
 
 test('the wrap-up never lets another tool run, and the budget is unchanged', async () => {
-  assert.deepEqual(RUN_PROGRESS_LIMITS, {consecutiveFailures: 4, totalFailures: 12, roundsWithoutProgress: 8, identicalSuccesses: 2});
+  assert.deepEqual(RUN_PROGRESS_LIMITS, {consecutiveFailures: 4, recentFailures: 12, recentResults: 40, roundsWithoutProgress: 8, identicalSuccesses: 2});
   const {round, call} = await stopwatchTurn();
   const decisions = [];
   for (const [toolName, params] of [['exec', {command: 'ls'}], ['pixel_ods_workspace_preview_inspect', {siteId: 'x'}],
